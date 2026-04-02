@@ -10,7 +10,7 @@ Implementation reference for all error handling in Podders v2. Consolidates spec
 |------|-------|---------|----------|-------|-----------|--------------|
 | L1 | Context length exceeded | 400, input exceeds model limit | Split chunk in half, retry both halves | Yes (split) | warn | No |
 | L2 | Malformed request | 400, bad request body | Skip batch, alert | No | error | Yes — "LLM request error" on /settings |
-| L3 | Invalid API key | 401 | Halt ALL LLM jobs immediately | No | fatal | Yes — "API key invalid" banner on /settings |
+| L3 | Invalid API key | 401 (surfaced through Pi) | Halt ALL LLM jobs immediately | No | fatal | Yes — "API key invalid" banner on /settings |
 | L4 | Rate limited | 429 | Queue retry respecting `retry-after` header | Yes | warn | No (transient) |
 | L5 | Overloaded | 529 | Backoff 30s, retry | Yes, 3x max | warn | No unless all 3 fail, then error on /settings |
 | L6 | Server error | 500/502/503 | Exponential backoff: 2s, 8s, 32s | Yes, 3x | warn per attempt, error on final | No unless all 3 fail |
@@ -58,7 +58,7 @@ On final failure: `reports.delivery_status = 'failed'`, full context logged. Fai
 
 | Code | Error | Trigger | Response | Retry | Logged As | User-Visible |
 |------|-------|---------|----------|-------|-----------|--------------|
-| C1 | Missing required env | `ANTHROPIC_API_KEY` absent | Halt startup with clear message | No | fatal | Process won't start |
+| C1 | Missing required env | Provider API key absent (e.g. `ANTHROPIC_API_KEY` for Claude) | Halt startup with clear message | No | fatal | Process won't start |
 | C2 | Invalid env format | Malformed token list, bad port | Halt startup | No | fatal | Process won't start |
 | C3 | Invalid config update | Bad value via `PATCH /api/v1/config` | Reject with 400, validation error | No | info | Yes — form validation error |
 | C4 | Invalid source config | Bad sourceId format for source type | Reject with 400 | No | info | Yes — form validation error |
@@ -129,7 +129,7 @@ Reports with `delivery_status = 'failed'` listed with date, type, and error reas
 
 - API key valid/invalid indicator (based on last call result)
 - Today's cost from `llm_usage` table
-- If L3 (invalid key) fired: red banner "LLM pipeline halted — API key is invalid. Update ANTHROPIC_API_KEY and restart."
+- If L3 (invalid key) fired: red banner "LLM pipeline halted — API key is invalid. Update the provider API key and restart."
 
 ### Error Display Rules
 
@@ -144,7 +144,7 @@ Reports with `delivery_status = 'failed'` listed with date, type, and error reas
 |---------|-------------|---------------|
 | **LLM context exceeded (L1)** | Auto | Chunk split + retry. No intervention needed. |
 | **LLM batch skipped (L2, L8)** | Auto (partial) | Items remain `processing`. Crash recovery on next startup resets to `ready`. Items re-processed in next cycle. |
-| **LLM key invalid (L3)** | Manual | Update `ANTHROPIC_API_KEY` env var, restart container. All LLM jobs halted until then. |
+| **LLM key invalid (L3)** | Manual | Update the relevant provider API key env var (e.g. `ANTHROPIC_API_KEY` for Claude models), restart. All LLM jobs halted until then. |
 | **LLM rate/overload (L4, L5, L6)** | Auto | Built-in retry with backoff. If all retries fail, items stay `processing`, recovered on restart. |
 | **LLM bad JSON (L7)** | Auto | Correction prompt retry. If still fails, batch skipped, items recovered on restart. |
 | **Scraper in backoff (S1, S2, S4, S8, S9)** | Auto | Health check cron (5min) resets sources past `next_retry_at`. Successful fetch clears error_count. |

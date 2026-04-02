@@ -38,7 +38,7 @@ CREATE TABLE sources (
 );
 ```
 
-`.env` holds secrets only: `ANTHROPIC_API_KEY` (required), `DATABASE_URL` (Postgres connection string, required), `DISCORD_TOKENS` (optional — needed for Discord sources), `TWITTERAPI_KEY` (optional — needed for Twitter sources), `API_KEY` (auto-generated if missing).
+`.env` holds secrets only: `ANTHROPIC_API_KEY` (required if using Claude models, other provider keys as needed), `DATABASE_URL` (Postgres connection string, required), `DISCORD_TOKENS` (optional — needed for Discord sources), `TWITTERAPI_KEY` (optional — needed for Twitter sources), `API_KEY` (auto-generated if missing).
 
 ### Discord Gateway
 
@@ -674,7 +674,7 @@ Trap SIGTERM/SIGINT:
 | Database  | Postgres (pg / node-postgres) | Async, connection pool, concurrent writes, full-text search via tsvector |
 | Dashboard | Vite + React 19 + React Router | SPA, no SSR needed       |
 | Styling   | Tailwind CSS 4        | Utility-first, dark theme, responsive |
-| LLM       | @anthropic-ai/sdk     | Direct, wrapped in llm.ts       |
+| LLM       | @mariozechner/pi-ai   | Multi-provider, wrapped in llm.ts. Models swappable across providers |
 | LLM validation | zod              | LLM output parsing + enforcement |
 | API validation | Fastify JSON Schema | Route-level input validation    |
 | Twitter   | twitterapi.io          | Pay-per-use, $0.15/1K tweets     |
@@ -722,7 +722,7 @@ podders/
 │   │   └── decay.ts          # Daily relevance decay
 │   ├── deliver/
 │   │   └── webhook.ts        # Discord webhook (3 retries, backoff)
-│   ├── llm.ts                # Anthropic SDK (error taxonomy, token counting, cost logging)
+│   ├── llm.ts                # Pi AI wrapper (error taxonomy, prompt injection defense, chunk-split retry)
 │   └── scheduler.ts          # node-cron jobs + mutex + startup sequence
 ├── dashboard/
 │   ├── src/

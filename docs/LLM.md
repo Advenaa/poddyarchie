@@ -1,6 +1,8 @@
 # LLM Wrapper Reference
 
-All LLM calls in Podders go through `src/llm.ts`. Never import `@anthropic-ai/sdk` directly.
+All LLM calls in Podders go through `src/llm.ts`. Never import `@mariozechner/pi-ai` directly.
+
+Under the hood, `llm.ts` delegates to Pi's `complete()` function for all LLM calls. Pi handles multi-provider support, token counting, cost tracking per call, tool calling, and provider-level retries. `llm.ts` handles prompt injection defense (nonce XML wrapping), chunk-split retry on context overflow, and stage-specific error decisions.
 
 ## `llm.call()` Function Signature
 
@@ -26,9 +28,9 @@ and cost logging. Call sites never deal with the SDK or retry logic directly.
 
 ## Model Configuration
 
-Model IDs live in `config.ts`. Never hardcode model strings at call sites.
+Model IDs live in `config.ts` as Pi model identifiers. Never hardcode model strings at call sites. Models can be swapped to any Pi-supported provider (Anthropic, OpenAI, Google, Groq, Mistral, etc.) by changing the config string.
 
-| Stage | Model | Default ID |
+| Stage | Model | Default ID (Pi format) |
 |-------|-------|------------|
 | Stage 1 (summarize) | Haiku | `claude-haiku-4-5-20251001` |
 | Stage 3 (synthesize) | Sonnet | `claude-sonnet-4-6-20250514` |
@@ -114,32 +116,20 @@ function estimateTokens(text: string): number {
 
 Chunk budget: 6,000 estimated tokens (~24K chars) per Stage 1 chunk.
 
-**Post-call actual** (from SDK response, for cost logging):
+**Post-call actual** (from Pi response, for cost logging):
 
 ```typescript
-const result = await anthropic.messages.create(/* ... */);
-const inputTokens = result.usage.input_tokens;    // actual from API
-const outputTokens = result.usage.output_tokens;   // actual from API
+const response = await complete(model, { /* ... */ });
+const inputTokens = response.usage.input;     // actual from Pi
+const outputTokens = response.usage.output;    // actual from Pi
+const costUsd = response.usage.cost.total;     // Pi computes cost per call
 ```
 
-The wrapper always logs actual token counts from the SDK response, never estimates.
+The wrapper always logs actual token counts and cost from the Pi response, never estimates.
 
 ## Cost Calculation
 
-### Price Table (per million tokens)
-
-| Model | Input | Output |
-|-------|-------|--------|
-| Haiku (`claude-haiku-4-5-20251001`) | $1.00 | $5.00 |
-| Sonnet (`claude-sonnet-4-6-20250514`) | $3.00 | $15.00 |
-
-### Cost Formula
-
-```typescript
-const costUsd =
-  (inputTokens / 1_000_000) * pricePerMillionInput +
-  (outputTokens / 1_000_000) * pricePerMillionOutput;
-```
+Cost tracking is handled by Pi. Each `complete()` response includes `response.usage.cost.total` with the USD cost for that call, computed from the provider's published pricing. No manual price table needed in Podders — Pi stays up to date across all supported providers.
 
 ### Usage Logging
 
@@ -154,8 +144,8 @@ Fields:
 - `id` — ULID
 - `stage` — one of `summarize`, `synthesize`, `urgency-classify`, `pulse`, `chat`
 - `model` — the actual model ID used
-- `input_tokens` / `output_tokens` — from SDK `usage` object
-- `cost_usd` — computed via the price table above
+- `input_tokens` / `output_tokens` — from Pi `response.usage` object
+- `cost_usd` — from Pi `response.usage.cost.total`
 - `created_at` — epoch ms
 
 Daily cost total is exposed via `GET /api/v1/status` (`llmCostToday` field).

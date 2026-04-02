@@ -10,7 +10,7 @@ Podders v2 is a 24/7 market intelligence engine that scrapes social media (Disco
 - **Server**: Fastify v5 (API + static dashboard serving)
 - **Database**: PostgreSQL via pg (node-postgres) with connection pool
 - **Dashboard**: Vite + React 19 + React Router + Tailwind CSS 4
-- **LLM**: @anthropic-ai/sdk (Haiku for Stage 1, Sonnet for Stage 3 + pulse)
+- **LLM**: @mariozechner/pi-ai (Haiku for Stage 1, Sonnet for Stage 3 + pulse — models swappable to any Pi-supported provider)
 - **Validation**: zod (LLM output), Fastify JSON Schema (API input)
 - **Twitter**: twitterapi.io REST API ($0.15/1K tweets)
 - **Embeddings**: @google/generative-ai (Gemini text-embedding-004, 768 dims)
@@ -62,7 +62,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 - **ESM only** — no CommonJS. All imports use `.js` extensions in compiled output.
 - **TypeScript strict** — `strict: true` in tsconfig, no `any` escape hatches.
 - **Async DB** — all database calls use `async/await` via the pg connection pool. No synchronous queries.
-- **All LLM calls via `llm.ts`** — never import `@anthropic-ai/sdk` directly. The wrapper handles retries, error taxonomy, token counting, and cost logging.
+- **All LLM calls via `llm.ts`** — never import `@mariozechner/pi-ai` directly. The wrapper handles retries, error taxonomy, prompt injection defense, and stage-specific error decisions. Pi handles token counting, cost tracking, retries at the provider level, and multi-provider support. Models are swappable across providers (Anthropic, OpenAI, Google, Groq, Mistral, etc.) by changing the model string in config.
 - **zod for LLM output validation** — parse every LLM JSON response through a zod schema. Clamp values, default unknowns, enforce array limits.
 - **Fastify JSON Schema for API input** — define schemas on route options, not in handler bodies. Source enums, format validation, length caps.
 - **pino logging with secret masking** — mask `DISCORD_TOKENS`, `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `TWITTERAPI_KEY`, `API_KEY`, and webhook URLs in all log output. Indonesian content is first-class — process `eng` and `ind` languages (franc ISO 639-3 codes), output summaries always in English.
@@ -87,7 +87,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 
 | Var | Required | Notes |
 |-----|----------|-------|
-| `ANTHROPIC_API_KEY` | Yes | Claude API key |
+| `ANTHROPIC_API_KEY` | Yes (if using Claude models) | Claude API key. Other provider keys (e.g. `OPENAI_API_KEY`, `GOOGLE_API_KEY`) can be added as needed for Pi-supported models |
 | `GEMINI_API_KEY` | Yes | Google Gemini API key for embeddings (free tier: 1500 req/day) |
 | `DISCORD_TOKENS` | No | Comma-separated user tokens (needed for Discord sources) |
 | `TWITTERAPI_KEY` | No | For Twitter/X scraping |
