@@ -492,3 +492,76 @@ npm run test:integration
 ```
 
 The integration test takes 30-60 seconds due to real LLM calls. It is designed to fail loudly if any pipeline stage produces invalid output, ensuring the full chain from raw item to delivered webhook embed works end to end.
+
+---
+
+## 7. Prompt Regression Tests
+
+Separate from golden file tests (which validate parsing of frozen LLM output). Prompt regression tests send real inputs to the LLM and assert on output **properties**, not exact text. They catch regressions when prompts are edited.
+
+### Structure
+
+- Fixtures in `test/prompts/fixtures/` — 8 frozen real inputs, each a JSON file with raw scraped content.
+- Golden files assert on **properties**: entity count range, urgency classification, presence of specific entity names, sentiment sign, fact anchors. Never exact text comparison.
+- Each fixture runs 3 times to account for non-determinism. A property must hold in all 3 runs to pass.
+- `npm run test:prompts` — manual, not CI. Costs ~$0.25 per run.
+
+### Fixtures
+
+| Fixture | Purpose |
+|---------|---------|
+| `discord-en-routine-15.json` | Baseline: Discord EN, routine, 15 messages |
+| `discord-id-routine-slang.json` | Indonesian handling: Discord ID, routine, mixed slang |
+| `discord-en-breaking-exploit.json` | Urgency = breaking: Discord EN, breaking exploit |
+| `twitter-en-quiet-20.json` | Minimal output: Twitter EN, 20 tweets, quiet day |
+| `rss-regulatory-ojk.json` | Pre-summarize regulatory: OJK ruling, 6000 chars |
+| `rss-general-news.json` | Pre-summarize general: news article, 8000 chars |
+| `mixed-spam-heavy.json` | Signal extraction: mixed chunk, 60% noise |
+| `stage3-input-12-summaries.json` | Daily synthesis: 12 summaries + correlations |
+
+### Golden File Approach
+
+Each fixture has a companion `.expected.json` defining property assertions:
+
+```json
+{
+  "entities": {
+    "minCount": 2,
+    "maxCount": 8,
+    "mustInclude": ["Ethereum", "Solana"],
+    "mustExcludeTypes": []
+  },
+  "urgency": "routine",
+  "sentiment": { "sign": "positive" },
+  "factAnchors": [
+    "staking",
+    "3.2%"
+  ]
+}
+```
+
+The test runner checks:
+- **Entity count** falls within `[minCount, maxCount]`
+- **Required entities** appear in output (by canonical name or alias)
+- **Urgency** matches labeled value exactly
+- **Sentiment sign** matches (positive/negative/neutral band)
+- **Fact anchors** — specific strings that must appear somewhere in the summary or keyEvents
+
+### Regression Metrics
+
+| Metric | Definition | Threshold |
+|--------|-----------|-----------|
+| Entity recall | found / expected entities (3+ mentions in fixture) | Must stay >80% |
+| Urgency accuracy | output urgency matches labeled fixture | Must match exactly |
+| Key fact preservation | pre-summarize output contains defined anchor facts | All anchors present |
+
+A prompt change is a **regression** if entity recall drops below 80% or urgency misclassifies on any fixture.
+
+### CI Plan
+
+| Test type | When | LLM calls |
+|-----------|------|-----------|
+| Structural tests (zod parsing, chunking, decision tree) | Every push | None |
+| Prompt regression tests (`npm run test:prompts`) | Manual, before merging prompt changes | Yes (~$0.25/run) |
+
+Prompt tests are never automated in CI — they cost money and are non-deterministic. Run them locally before any PR that touches system prompts or few-shot examples.

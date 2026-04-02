@@ -338,6 +338,8 @@ async function runDaily() {
   // Stage 3 prompt includes explicit causal instruction:
   //   "State causal connections explicitly. If A caused B, say so.
   //    If correlation is unconfirmed, qualify with 'likely' or 'appears to'."
+  // Daily synthesis includes raw Stage 1 correlated entity data alongside the 8 pulses,
+  // so Sonnet can cross-check pulse narrative against actual data.
   const input = assembleStage3Input(ranked, correlations, yesterday?.tldr);
   const report = await callSonnet(input);  // see PIPELINE.md for prompt
   
@@ -494,6 +496,8 @@ A typical day for a setup with 5 Discord channels, 10 Twitter accounts, 20 RSS f
 
 12:00 WIB  — Market pulse fires (every 3h)
 (05:00 UTC)  - Reads summaries from last 3h window
+             - Computes drift flags (prior pulse entity sentiments vs current Stage 1 data)
+             - Injects ground truth entity table + drift flags into prompt context
              - 1 Sonnet call → short pulse (output scales with activity)
              - Webhook delivers muted grey embed
              - Quiet periods get shorter pulses, busy periods get fuller ones

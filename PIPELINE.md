@@ -539,6 +539,28 @@ A lightweight, more frequent synthesis that runs every 3 hours using Sonnet. Pro
 
 **Quality gate**: skip the pulse entirely if zero events and zero entities across all summaries in the window. Log the skip, don't fire the webhook.
 
+**Drift detection**: before each pulse Sonnet call, compare the prior pulse's entity sentiments against current Stage 1 data. If any entity's sentiment shifted by more than 0.4, inject a drift flag so Sonnet re-evaluates prior framing instead of carrying stale narrative forward. Ground truth entity data from the current 3h window is always included — raw structured data, not prose — so Sonnet can cross-check its framing against actual numbers.
+
+```typescript
+function detectDrift(
+  priorPulseEntities: EntitySentiment[],
+  currentStage1Entities: Stage1Entity[]
+): string[] {
+  const flags: string[] = [];
+  for (const prior of priorPulseEntities) {
+    const current = currentStage1Entities.find(e => e.name === prior.entity);
+    if (current && Math.abs(current.sentiment - prior.sentiment) > 0.4) {
+      flags.push(
+        `[DRIFT: prior pulse rated ${prior.entity} ${prior.sentiment > 0 ? '+' : ''}${prior.sentiment.toFixed(1)}, current data shows ${current.sentiment > 0 ? '+' : ''}${current.sentiment.toFixed(1)}]`
+      );
+    }
+  }
+  return flags;
+}
+```
+
+Cost: zero new LLM calls, ~300 extra input tokens per pulse, ~$0.003/day.
+
 **Prompt**:
 
 ```
@@ -554,11 +576,16 @@ If nothing significant happened, say so in one sentence.
 Previous pulse TL;DR for continuity:
 {previousPulseTldr}
 If no previous pulse is available, report current state without comparative framing.
+
+Stage 1 entity data for this window (ground truth — use to verify your framing):
+{entityTable}
+
+{driftFlags.length > 0 ? 'SENTIMENT DRIFT DETECTED:\n' + driftFlags.join('\n') + '\nRe-evaluate prior framing against current data.' : ''}
 ```
 
 **Output**: `MarketReport` with `type: 'pulse'`, short `tldr`, `keyEvents` (max 3), no `sections`, no `entitySentiment`.
 
-**Daily synthesis**: at digest time, the daily Stage 3 report reads the 8 pulse outputs from the previous day plus correlated entities. This gives Sonnet a pre-digested timeline rather than raw summaries, improving coherence.
+**Daily synthesis**: at digest time, the daily Stage 3 report reads the 8 pulse outputs from the previous day plus correlated entities plus raw Stage 1 correlated entity data. Pulses give Sonnet a pre-digested timeline; raw correlations let it cross-check pulse narrative against actual data. This catches cases where pulse drift accumulated across the day.
 
 **Delivery**: same Discord webhook but with a distinct embed color (muted grey `0x4A4A5A`). Title: `Market Pulse — HH:MM WIB`. No "View full report" link (too lightweight for dashboard).
 
@@ -632,7 +659,8 @@ New on Radar
 
 | Job | Interval | Description |
 |-----|----------|-------------|
-| Stage 1 micro-batch | Per-source `poll_interval` | Scheduler checks which sources are due based on `poll_interval` and `last_fetched_at`, then processes their `ready` items concurrently |
+| Stage 1 micro-batch (Twitter/RSS/News) | Per-source `poll_interval` | Scheduler checks which sources are due based on `poll_interval` and `last_fetched_at`, then processes their `ready` items concurrently |
+| Stage 1 Poisson claim (Discord) | Adaptive, checked every 60s | Discord uses Poisson-based claim gate instead of fixed `poll_interval`. Compares accumulated `ready` items against expected rate (lambda) from `source_rate_history`. Triggers at 1.5x expected or >10 items. Flags potential breaking at 3x expected or Poisson P < 0.01. See [SCHEDULER.md](./docs/SCHEDULER.md) for thresholds and Poisson function. |
 | Stage 2 correlate | After each Stage 1 | Run correlation query |
 | Stage 3 daily | Configurable (default 09:00 in configured timezone) | Midnight-to-midnight synthesis |
 | Stage 3 flash | Event-triggered | On `urgency: 'breaking'` from Stage 1 |

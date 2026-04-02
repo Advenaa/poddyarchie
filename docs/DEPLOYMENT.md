@@ -85,6 +85,25 @@ sudo systemctl start podders
 * * * * * curl -sf http://localhost:3000/api/v1/status || systemctl restart podders
 ```
 
+### Process Watchdog
+
+The main process writes a heartbeat file (`/tmp/podders-heartbeat`) every 60s. An external watchdog checks file age and restarts the process if it goes stale (>300s). This catches hangs that pass the HTTP health check but stop doing real work.
+
+**systemd watchdog** (add to `[Service]` section):
+
+```ini
+WatchdogSec=300
+```
+
+systemd sends `SIGABRT` if the watchdog timeout expires. Combine with `Restart=always` for auto-recovery.
+
+**Cron-based watchdog** (alternative if not using systemd):
+
+```bash
+# Add to crontab — checks every 5 minutes
+*/5 * * * * [ $(( $(date +%s) - $(stat -c %Y /tmp/podders-heartbeat 2>/dev/null || echo 0) )) -gt 300 ] && systemctl restart podders
+```
+
 ## TLS / HTTPS
 
 **Caddy** as reverse proxy — automatic HTTPS with Let's Encrypt, ~10MB RAM.

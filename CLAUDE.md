@@ -25,6 +25,7 @@ npm run dev              # Dev server with watch (ts-node + Vite dev)
 npm run start            # Production: node dist/index.js run
 npm test                 # Unit tests (golden file + normalize)
 npm run test:integration # Full pipeline integration tests (requires .env)
+npm run test:prompts     # Prompt regression tests (manual, ~$0.25/run, requires .env)
 ```
 
 ## File Structure
@@ -50,7 +51,8 @@ dashboard/
 test/
   unit/              # Golden file + normalize tests
   integration/       # Full pipeline (manual, not CI)
-  prompts/           # Prompt regression inputs
+  prompts/           # Prompt regression tests (manual, real LLM calls)
+    fixtures/        # 8 frozen real inputs + .expected.json golden files
 ```
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and build order.
@@ -93,6 +95,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 | `DATABASE_URL` | Yes | Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/podders`) |
 | `PORT` | No | Default 3000 |
 | `PUBLIC_URL` | No | For "View full report" links in webhooks |
+| `ALERT_WEBHOOK_URL` | No | Discord webhook for critical health alerts (separate channel) |
 
 ## Reading Order
 

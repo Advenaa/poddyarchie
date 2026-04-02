@@ -143,9 +143,20 @@ Runs after normalize saves items as `ready`, before the claim & chunk step. Deci
 
 ### Scheduler
 
-Uses `node-cron` for a short-interval tick (every 60s) that checks which sources are due for polling based on their individual `poll_interval` and `last_fetched_at` from `source_state`. No single global 2h cron — each source has its own cadence. Additionally, a 3-hour pulse cron (8x/day) triggers Sonnet market pulse synthesis. Event-driven jobs (Stage 2 after Stage 1, flash after breaking, delivery after daily/pulse) called directly at end of triggering function.
+Uses `node-cron` for a short-interval tick (every 60s) that checks which sources are due for processing. Two claim mechanisms depending on source type:
 
-**Due-source query**: on each tick, select sources where `now - last_fetched_at >= poll_interval` (or `last_fetched_at IS NULL` for new sources). Process all due sources in parallel via `Promise.allSettled` — Postgres handles concurrent writes.
+- **Twitter/RSS/News**: fixed `poll_interval`. Due when `now - last_fetched_at >= poll_interval`.
+- **Discord**: Poisson-based adaptive claim. Messages arrive via WebSocket and sit as `ready`. Every 60s, the scheduler counts accumulated `ready` items and compares against the expected rate (lambda) from `source_rate_history`. Two thresholds:
+  - **Process threshold**: actual > expected x 1.5 OR actual > 10 items — trigger processing.
+  - **Alert threshold**: actual > expected x 3 OR Poisson survival probability < 0.01 — process immediately, flag as potential breaking event.
+
+This catches breaking events ~12 minutes faster than fixed 15-min intervals. Lambda is learned from the last 7 days, keyed by hour-of-day and day-of-week.
+
+Additionally, a 3-hour pulse cron (8x/day) triggers Sonnet market pulse synthesis. Event-driven jobs (Stage 2 after Stage 1, flash after breaking, delivery after daily/pulse) called directly at end of triggering function.
+
+**Due-source query (Twitter/RSS/News)**: on each tick, select sources where `now - last_fetched_at >= poll_interval` (or `last_fetched_at IS NULL` for new sources). Process all due sources in parallel via `Promise.allSettled` — Postgres handles concurrent writes.
+
+**Poisson check (Discord)**: on each tick, count `ready` items per Discord source. Look up lambda from `source_rate_history` for current hour and day-of-week. Compare against thresholds. Update `source_rate_history` after each processing cycle.
 
 **Overlap guard**: each tick has a `running` boolean mutex. If a tick fires while the previous run is in-flight, skip and log warning. Batch-claiming SQL prevents double-processing of items regardless.
 
@@ -172,13 +183,18 @@ scheduler (node-cron, every 60s tick)
         synthesize.runFlash()      # Stage 3 flash: Sonnet, last 4h, webhook with [FLASH]
 
 scheduler (node-cron, every 3h — 8x/day)
-  → synthesize.runPulse()          # Stage 3 pulse: Sonnet, last 3h window
+  → synthesize.runPulse()          # Stage 3 pulse: Sonnet, last 3h window (ground truth + drift flags injected)
     → webhook.deliver(report)      # Delivery: muted grey Discord embed (skip if nothing happened)
 
 scheduler (node-cron, daily at digest_time)
-  → synthesize.runDaily()          # Stage 3 daily: Sonnet, reads 8 pulse outputs + full day's correlated entities
+  → synthesize.runDaily()          # Stage 3 daily: Sonnet, reads 8 pulse outputs + correlated entities + raw Stage 1 entity data
     → webhook.deliver(report)      # Delivery: POST to Discord webhook
 ```
+
+scheduler (node-cron, every 5min)
+  → health.check()                 # 7 checks → inserts into health_events if threshold breached
+                                   # Critical events → POST to ALERT_WEBHOOK_URL (red Discord embed)
+                                   # Dedup: skip if same category+message unacknowledged within 30min
 
 Each `→` is a direct function call. No message passing, no event emitters.
 
@@ -230,7 +246,10 @@ If volume exceeds 50 summaries, rank by `item_count * avg_engagement` and take t
 - 1-3 summaries, all routine → 2-3 sentences (`maxTokens: 300`)
 - 4-10 summaries, some elevated → paragraph + key events (`maxTokens: 800`)
 - 10+ summaries or any breaking → full short report with sections (`maxTokens: 1500`)
-Quality gate: skip delivery if nothing happened. Daily synthesis reads all 8 pulse outputs + full day's correlated entities (not raw summaries). Delivered via Discord webhook with muted grey embed.
+
+Before each pulse call, inject ground truth (raw Stage 1 entity data for the current 3h window) and drift flags (prior pulse entity sentiments vs current Stage 1 data, threshold 0.4). Zero extra LLM calls, ~300 extra input tokens per pulse. See PIPELINE.md for `detectDrift` function.
+
+Quality gate: skip delivery if nothing happened. Daily synthesis reads all 8 pulse outputs + full day's correlated entities + raw Stage 1 correlated entity data (not raw summaries). Delivered via Discord webhook with muted grey embed.
 
 **Duplicate prevention**: for daily reports, check `SELECT id FROM reports WHERE date=? AND type='daily'` before inserting. If exists, skip and log. Flash and pulse reports allow multiples per day.
 
@@ -384,6 +403,36 @@ CREATE TABLE llm_usage (
 );
 ```
 
+**health_events**
+```sql
+CREATE TABLE health_events (
+  id TEXT PRIMARY KEY,
+  category TEXT NOT NULL,           -- source | llm | scheduler | db | pipeline | cost
+  severity TEXT NOT NULL,           -- warn | critical
+  message TEXT NOT NULL,
+  metadata JSONB DEFAULT '{}',
+  acknowledged BOOLEAN DEFAULT false,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_health_events_unacked ON health_events (acknowledged, created_at DESC) WHERE acknowledged = false;
+```
+
+**source_rate_history** (Poisson baseline for Discord claim gate)
+```sql
+CREATE TABLE source_rate_history (
+  source TEXT NOT NULL,
+  source_id TEXT NOT NULL,
+  hour_of_day INTEGER NOT NULL,    -- 0-23
+  day_of_week INTEGER NOT NULL,    -- 0-6
+  avg_rate REAL NOT NULL,          -- messages per hour
+  sample_count INTEGER DEFAULT 0,
+  updated_at INTEGER NOT NULL,
+  PRIMARY KEY (source, source_id, hour_of_day, day_of_week)
+);
+```
+
+Tracks expected message rate (lambda) per source, per hour-of-day, per day-of-week. Learned from last 7 days. Used by the Poisson-based claim gate for Discord sources (see Scheduler section).
+
 ### Schema Versioning
 
 A `schema_version` table tracks the current version. `migrations.ts` checks on startup, runs numbered migration functions in a transaction, bumps version. No external migration library needed.
@@ -528,6 +577,8 @@ All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
 | `GET` | `/api/v1/config` | `{ webhookUrl, digestTime, timezone, publicUrl }` |
 | `PATCH` | `/api/v1/config` | Body: partial of above |
 | `GET` | `/api/v1/status` | `{ stages: { ingest, summarize, synthesize, delivery }, llmCostToday, allSourcesDisabled: bool }` |
+| `GET` | `/api/v1/health` | `{ events: HealthEvent[], sourceStates: SourceState[], lastPulse: number, lastDaily: number, cost24h: number }` — unacknowledged events + system vitals |
+| `PATCH` | `/api/v1/health/:id` | Acknowledge a health event |
 | `POST` | `/api/v1/auth/rotate` | `{ apiKey: "new-key-displayed-once" }` |
 
 **Search (after full-text search, build step 8.5):**
@@ -550,7 +601,7 @@ All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
 
 How it works: user question is embedded via Gemini (same model as all embeddings), cosine similarity finds top 10 relevant summaries/reports/items from the in-memory vector cache, those results plus last 5 messages of conversation history are passed to Sonnet as context, Sonnet generates an answer grounded in the retrieved data. Conversation history stored in memory (cleared on restart). Sonnet system prompt instructs: answer ONLY from provided context, cite sources, say "I don't have data on that" if no relevant results, never speculate beyond the data. Each chat message = 1 Gemini embedding call + 1 Sonnet call.
 
-18 endpoints total.
+20 endpoints total.
 
 ### Webhook Content
 
@@ -573,6 +624,8 @@ Ships with MVP, not optional.
 - **LLM cost tracking** — `llm_usage` table, daily total on `/api/v1/status`
 - **Pipeline status** — last successful run per stage, visible on `/settings`
 - **Failed deliveries** — `reports.delivery_status`, visible on `/settings`
+- **Health events** — `health_events` table, 7 automated checks every 5min, critical alerts to `ALERT_WEBHOOK_URL`
+- **Process watchdog** — heartbeat file at `/tmp/podders-heartbeat` every 60s, systemd/cron restarts if >300s stale
 
 ## 8. Deployment
 
@@ -603,6 +656,7 @@ Trap SIGTERM/SIGINT:
 | `PORT` | No | Default 3000 |
 | `DATA_DIR` | No | Backups location, default `./data` |
 | `PUBLIC_URL` | No | Dashboard URL for webhook links (e.g., `https://podders.yourdomain.com`) |
+| `ALERT_WEBHOOK_URL` | No | Discord webhook for critical health alerts (separate channel from delivery) |
 
 ## 9. Testing Strategy
 
@@ -746,7 +800,7 @@ At 5,000 items/day post-normalization:
 
 ## Build Order
 
-1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, app_config, embeddings)
+1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, source_rate_history, app_config, embeddings, health_events)
 2. `llm.ts` wrapper (error taxonomy, retry, token counting)
 3. `embed.ts` wrapper (Gemini text-embedding-004, retry, cost logging)
 4. RSS ingestion (simplest source — `rss-parser` + normalize)
@@ -760,7 +814,7 @@ At 5,000 items/day post-normalization:
 12. In-memory vector cache for summaries + reports (load on startup)
 13. Semantic search endpoint (`GET /api/v1/search?mode=semantic`)
 14. RAG chat endpoint (`POST /api/v1/chat`) — embed question via Gemini, retrieve top 10 from vector cache, pass to Sonnet with conversation history, return grounded answer with source citations
-15. Discord ingestion + source_state + Gateway multi-token
+15. Discord ingestion + source_state + Gateway multi-token + Poisson claim gate (`source_rate_history`)
 16. Twitter/X via twitterapi.io
 17. News article extraction (Readability)
 18. Stage 2 correlate (SQL cross-source signals — needs multiple sources)
@@ -776,7 +830,8 @@ Steps 15-17 are independent and can be built in parallel.
 25. `llm_usage` table + cost tracking
 26. Data retention cron + backup cron (cascade embedding deletes with item retention)
 27. Observability (cost dashboard, pipeline status, secret masking)
-28. Discovery endpoints (Discord guilds, RSS auto-detect)
-29. Graceful shutdown + Caddy TLS + pm2/systemd deploy
+28. Health monitoring (`health_events` table, 7 checks every 5min, alert webhook, process heartbeat watchdog)
+29. Discovery endpoints (Discord guilds, RSS auto-detect)
+30. Graceful shutdown + Caddy TLS + pm2/systemd deploy
 
 **Goal**: all sources ingesting, entity resolution working, dashboard live, semantic search and RAG chat operational. Everything ships together.

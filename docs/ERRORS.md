@@ -102,6 +102,10 @@ All logging via pino (structured JSON). Secrets masked: `DISCORD_TOKENS`, `ANTHR
 
 ## User-Visible Error States (/settings)
 
+### Health Events
+
+Automated checks run every 5 minutes and insert into `health_events` when thresholds are breached. Critical events also fire to `ALERT_WEBHOOK_URL` (red Discord embed). Warn events surface on `/settings` only. Events dedup by category+message within 30 minutes. Acknowledge events via `PATCH /api/v1/health/:id` or from the settings page. See `GET /api/v1/health` for unacknowledged events, source states, last pulse/daily timestamps, and 24h cost.
+
 ### Pipeline Health Section
 
 Shows last successful run per stage (ingest, summarize, synthesize, delivery). Each stage displays:

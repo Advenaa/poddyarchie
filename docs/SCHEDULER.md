@@ -37,13 +37,15 @@ Cron registration order matches this table top-to-bottom. Event-driven jobs (Sta
 
 | Job | Type | Cron Expression | Calls | Depends On |
 |-----|------|-----------------|-------|------------|
-| Stage 1 micro-batch | per-source | Each source's `poll_interval` (e.g., Discord 30min, Twitter 2h, RSS 15min) | `summarize.runBatch()` | Items with `status='ready'` for sources due for processing |
+| Stage 1 micro-batch (Twitter/RSS/News) | per-source | Each source's `poll_interval` (e.g., Twitter 2h, RSS 15min) | `summarize.runBatch()` | Items with `status='ready'` for sources due for processing |
+| Stage 1 Poisson claim (Discord) | check every 60s | Adaptive: Poisson threshold against `source_rate_history` | `summarize.runBatch()` | Discord `ready` items exceeding expected rate x 1.5 OR > 10 items |
 | Stage 3 daily | cron | `{mm} {hh} * * *` in configured TZ (default `0 9 * * *`) | `synthesize.runDaily()` | Summaries from previous calendar day |
 | Market pulse | cron | `0 */3 * * *` UTC (every 3h) | `pulse.run()` | Summaries from last 3h window. Sonnet. Output scales with activity. |
 | Entity decay | cron | `0 0 * * *` UTC | `decay.run()` | All entities |
 | Data retention | cron | `5 0 * * *` UTC (after decay) | `retention.run()` | Runs after decay so pruned entities are already decayed |
 | Backup | cron | `10 0 * * *` UTC (after retention) | `db.backup()` (pg_dump) | Runs after retention so backup is clean |
 | Scraper health | cron | `*/5 * * * *` (every 5min) | `sources.healthCheck()` | `source_state` rows with `status='backoff'` |
+| Health check | cron | `*/5 * * * *` (every 5min) | `health.check()` | 7 checks: source silence, source disabled, LLM failures, missed pulse, missed daily, DB pool, cost spike. Inserts into `health_events`. Critical → `ALERT_WEBHOOK_URL`. Dedup: skip if same category+message unacknowledged within 30min. |
 | Stage 2 correlate | direct call | After each Stage 1 | `correlate.run()` | Stage 1 completion |
 | Stage 3 flash | direct call | When Stage 1 returns `urgency: 'breaking'` | `synthesize.runFlash()` | Breaking chunk from Stage 1 |
 | Delivery | direct call | After Stage 3 daily | `webhook.deliver(report)` | Stage 3 daily completion |
@@ -65,6 +67,7 @@ const jobState: Record<string, boolean> = {
   'retention': false,
   'backup': false,
   'health-check': false,
+  'health-monitor': false,
 };
 
 function withMutex(jobName: string, fn: () => Promise<void>): () => Promise<void> {
@@ -91,6 +94,40 @@ function withMutex(jobName: string, fn: () => Promise<void>): () => Promise<void
 **Why this is safe**: batch-claiming SQL (`UPDATE items SET batch_id = $1, status = 'processing' WHERE status = 'ready'`) prevents double-processing regardless of mutex. The mutex is a performance guard (don't waste LLM calls), not a correctness guard.
 
 Event-driven jobs (Stage 2, flash, delivery) do not need a mutex. They execute inline at the tail of their parent function and cannot overlap by construction.
+
+---
+
+## 3.5. Poisson-Based Claim Gate (Discord)
+
+Discord messages arrive via WebSocket and sit as `ready`. Instead of a fixed `poll_interval` timer, the scheduler checks every 60 seconds:
+
+1. Count accumulated `ready` items for each Discord source.
+2. Compare against expected rate (lambda) for that source at this hour-of-day and day-of-week, learned from last 7 days via `source_rate_history`.
+3. Two thresholds:
+   - **Process threshold**: actual > expected x 1.5 OR actual > 10 items — trigger processing.
+   - **Alert threshold**: actual > expected x 3 OR Poisson survival probability < 0.01 — process immediately, flag as potential breaking event.
+
+### Poisson survival function
+
+```javascript
+function poissonSurvival(k, lambda) {
+  let sum = 0;
+  for (let i = 0; i < k; i++) {
+    sum += Math.exp(-lambda) * Math.pow(lambda, i) / factorial(i);
+  }
+  return 1 - sum; // P(X >= k)
+}
+```
+
+### Baseline tracking
+
+Lambda is stored in `source_rate_history`, keyed by `(source, source_id, hour_of_day, day_of_week)`. Updated after each processing cycle with a rolling average over the last 7 days.
+
+### What this changes
+
+- **Discord sources**: Poisson-triggered claim (check every 60s), NOT fixed `poll_interval`. The claim gate is a decision point, not just a timer.
+- **Twitter/RSS/News**: unchanged, still fixed `poll_interval`.
+- Catches breaking events ~12 minutes faster than fixed 15-min intervals.
 
 ---
 
@@ -167,6 +204,26 @@ cron('{mm} {hh} * * *', { timezone })
      })
 ```
 
+### Entry 4: Health Check (every 5min)
+
+```
+cron('*/5 * * * *', { timezone: 'UTC' })
+  └─ withMutex('health-monitor', async () => {
+       await health.check()
+       //   ├─ source silence: no data for 3x poll_interval → warn
+       //   ├─ source disabled: any source status='disabled' → critical
+       //   ├─ LLM failures: 0 LLM calls when items ready for >1h → critical
+       //   ├─ missed pulse: >4h since last pulse → warn
+       //   ├─ missed daily: >26h since last daily → critical
+       //   ├─ DB pool: idle connections = 0 for 3 consecutive checks → warn
+       //   ├─ cost spike: hourly cost >3x the 7-day average → warn
+       //   ├─ dedup: skip if same category+message unacknowledged within 30min
+       //   └─ critical events → POST to ALERT_WEBHOOK_URL (red Discord embed)
+     })
+```
+
+Also writes heartbeat file (`/tmp/podders-heartbeat`) every 60s from the main process loop. External watchdog (systemd or cron) restarts if file age >300s.
+
 ### Function Signatures
 
 ```typescript
@@ -182,6 +239,9 @@ export async function runFlash(): Promise<MarketReport | null>
 
 // src/process/pulse.ts
 export async function run(): Promise<MarketReport | null>
+
+// src/health.ts
+export async function check(): Promise<void>
 
 // src/deliver/webhook.ts
 export async function deliver(
