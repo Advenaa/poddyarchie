@@ -254,5 +254,6 @@ Bootstrap admins are set via `ADMIN_USER_IDS` env var. Additional users invited 
 | [PIPELINE.md](./PIPELINE.md) | LLM prompts, chunking, validation |
 | [docs/INTEGRATION.md](./docs/INTEGRATION.md) | End-to-end message flow |
 | [docs/DATAFLOW.md](./docs/DATAFLOW.md) | ASCII data flow diagrams |
+| [docs/BUILD.md](./docs/BUILD.md) | Implementation plan: 3 phases, 32 steps |
 | [docs/ROADMAP.md](./docs/ROADMAP.md) | Feature roadmap |
 | [docs/](./docs/) | Everything else |
