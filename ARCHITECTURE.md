@@ -33,6 +33,8 @@ CREATE TABLE sources (
   enabled BOOLEAN DEFAULT true,
   priority INTEGER DEFAULT 1,
   poll_interval INTEGER DEFAULT 7200,  -- per-source poll interval in seconds (default 2h)
+  trust_weight REAL NOT NULL DEFAULT 0.5,         -- manual trust weight (0.1-1.0). High=1.0, Medium=0.7, Default=0.5, Low=0.3
+  initial_trust_weight REAL NOT NULL DEFAULT 0.5, -- floor for auto-adjustment (system nudges ±0.2 from this)
   added_at INTEGER NOT NULL,
   PRIMARY KEY (source, source_id)
 );
@@ -109,17 +111,19 @@ interface RawItem {
 
 `engagement` is a first-class indexed column for "high-engagement items" queries. Per-source defaults: Twitter uses `log10(likes + 2*retweets + 3*quotes) * 20`, Discord uses reaction count, RSS always sets `engagement: 0` (no signal available).
 
-## 3. Normalize (Stage 0 — No LLM)
+## 3. Normalize (Stage 0)
 
-Runs on every incoming item. Pure rule-based — no LLM calls.
+Runs on every incoming item. Steps 1-5 are pure rule-based (no LLM calls). Step 6 (Indonesian translation) uses one Haiku call per Indonesian item.
 
 1. **Truncate** — items exceeding 20,000 characters are truncated to that limit. Prevents single oversized items (e.g., full articles from RSS) from blowing the Stage 1 chunk budget.
 2. **Dedup** — `sha256(source + sourceId + content.slice(0, 200))`. Plus exact URL match across sources after URL expansion. No SimHash for MVP — exact hash + URL dedup covers 90%.
 3. **URL expansion** — resolve t.co, bit.ly redirects for cross-source dedup.
 4. **Spam filter** — rule-based. English: bot accounts, sub-5-word posts, "gm/gn". Indonesian: "wm", "done min/sudah min", "gas!", "mantap", single-emoji, airdrop copypasta. Kills 40-60% of Discord volume.
+4.5. **Prompt injection scan** — InstructDetector scans content for injection attempts. Flagged items saved as `status: 'filtered'` with `filter_reason: 'injection_detected'`, not deleted. Results cached per content hash. Also applies Unicode normalization (NFC) and strips zero-width characters, direction overrides, and homoglyphs. Near-zero cost (no LLM calls). Part of the five-layer defense model: (1) Unicode normalize, (2) InstructDetector, (3) XML delimiter wrapping at LLM call, (4) entity post-verification on output, (5) privilege separation via zod validation.
 5. **Language detection** — `franc` library. Process English (`eng`) and Indonesian (`ind`) — franc uses ISO 639-3 codes — exclude others. Indonesian is first-class.
+6. **Indonesian translation** — if detected language is `ind`, translate content to English via Haiku before saving as `ready`. Preserves entity names, numbers, and technical terms. Sets `original_language = 'ind'` and `translated = true` on the item. English content skips this step. Rationale: 14-17pp accuracy loss when LLMs process low-resource languages directly vs English input (Left Behind, Feb 2026; XBridge, Mar 2026).
 
-Items pass → `status: 'ready'` with full original content. Filtered → `status: 'filtered'` (kept for debugging).
+Items pass → `status: 'ready'` with full original content (translated to English if Indonesian). Filtered → `status: 'filtered'` (kept for debugging).
 
 ## 3.5. Pre-Summarize
 
@@ -173,7 +177,7 @@ scheduler (node-cron, every 60s tick)
   → getDueSources()                # SELECT sources WHERE now - last_fetched_at >= poll_interval
   → Promise.allSettled(            # Process all due sources in parallel
       dueSources.map(source =>
-        ingest(source)             # Fetch + normalize for this source
+        ingest(source)             # Fetch + normalize (includes Indonesian→English translation) for this source
       )
     )
   → preSummarize.run()             # Compress low-density RSS/news, skip Discord/Twitter/urgent/dense
@@ -204,7 +208,11 @@ Each `→` is a direct function call. No message passing, no event emitters.
 
 **Zero items**: if no `ready` items exist for a window, log `info` and skip. No LLM call, no empty summary created.
 
-Each chunk → one Haiku call (`maxTokens: 3000`) returning structured JSON. Entity extraction happens here — no separate pass. Scraped content wrapped in `<scraped_content>` XML delimiters with explicit instruction to treat as untrusted data (prompt injection defense).
+Each chunk → one Haiku call (`maxTokens: 3000`) returning structured JSON. Entity extraction happens here — no separate pass. Scraped content wrapped in `<scraped_content>` XML delimiters with explicit instruction to treat as untrusted data (prompt injection defense). Five-layer prompt injection defense applies: (1) Unicode normalization, (2) InstructDetector scan at ingest, (3) XML delimiter wrapping, (4) entity post-verification, (5) privilege separation via zod validation.
+
+**Budget hints**: sparse chunks (low entity density, <4K tokens, no urgency keywords) get a "Target ~400 tokens" hint appended to the system prompt. Dense chunks get no constraint. Reduces output tokens ~30-40% on routine content without accuracy loss (OckBench, ICLR 2026; Token-Budget-Aware Reasoning, 2024).
+
+**Confidence routing**: Stage 1 output includes a `confidence` field (1-10). If confidence < 5 AND urgency != "routine", the chunk is escalated to Sonnet for re-processing. ~95% of chunks stay with Haiku; the ~5% that matter (breaking events with ambiguity) get Sonnet quality. Cost: ~2-3 escalations/day.
 
 **Exemplar slots**: when assembling Stage 3 input from Stage 1 outputs, 10 exemplar slots are used. 7 slots ranked by engagement score. 3 slots reserved for RSS/news items ranked by entity density + urgency (since RSS engagement is always 0 and would never surface otherwise).
 
@@ -221,15 +229,20 @@ See [PIPELINE.md](./PIPELINE.md) for prompt details, chunking code, and validati
 
 Three states: `ready` → `processing` → `processed`.
 
-**Entity resolution** uses alias lookup-then-insert against `entity_aliases` table (lowercase normalized). CoinGecko token list seeds the alias table. `INSERT ... ON CONFLICT DO NOTHING` handles concurrent batch writes gracefully.
+**Entity resolution** uses a three-tier disambiguation pipeline:
+1. **Rule-based alias lookup** — lowercase-normalized lookup against `entity_aliases` table. Handles ~95% of entities (ETH, Bitcoin, OJK) instantly. CoinGecko token list seeds the alias table.
+2. **Context-based disambiguation** — if alias has multiple candidates, use co-occurring entities from the same chunk as free context to disambiguate (DeepEL pattern). "Wormhole" + "bridge" + "exploit" = DeFi protocol, not the game.
+3. **Batched LLM disambiguation** — remaining ambiguous entities across all chunks in a processing cycle are batched into a single Haiku call. Results saved as new context-aware aliases (`alias` + `context_key`) for future rule-based resolution. Self-improving: each disambiguation reduces future LLM calls.
+
+`INSERT ... ON CONFLICT DO NOTHING` handles concurrent batch writes gracefully.
 
 ### Stage 2: Correlate (SQL, no LLM)
 
-Cross-source signal detection — entities appearing in 2+ sources within the same window. See [PIPELINE.md](./PIPELINE.md) for the query.
+Cross-source signal detection — entities appearing across multiple sources within the same window, weighted by source `trust_weight`. A flash report fires when the weighted trust sum of reporting sources >= 1.5 (not a simple 2+ source count, which is gameable by coordinated bot accounts). Trust weights auto-adjust ±0.2 from initial manual weight based on confirmation history. See [PIPELINE.md](./PIPELINE.md) for the query.
 
 ### Stage 3: Synthesize (Sonnet, daily + flash + pulse)
 
-Reads all summaries from past 24h + correlated signals → `MarketReport`. Yesterday's TL;DR passed as context for temporal anchoring.
+Reads all summaries from past 24h + correlated signals + detected narratives → `MarketReport`. Yesterday's TL;DR passed as context for temporal anchoring. Narrative clusters (with signal strength: new/emerging/strong/stable/fading) are injected into the Sonnet prompt to provide thematic context beyond entity-level data.
 
 If volume exceeds 50 summaries, rank by `item_count * avg_engagement` and take top 30.
 
@@ -267,7 +280,8 @@ Quality gate: skip delivery if nothing happened. Daily synthesis reads all 8 pul
 | 429 rate limit | Respect `retry-after` header, queue retry |
 | 529 overloaded | Backoff 30s, retry up to 3x |
 | 500/502/503 | Retry 3x with exponential backoff (2s/8s/32s) |
-| Valid HTTP but invalid JSON | Retry once with correction prompt, then skip + log |
+| Valid HTTP but invalid JSON (parse failure) | Retry once with "output valid JSON" correction prompt, then skip + log |
+| Valid JSON but zod validation failure | Retry once with specific error paths fed back (e.g., "entities[12].sentiment: Expected <= 1.0, received 5.0"). Haiku sees exactly what to fix. 92% error reduction vs generic retry (PARSE, EMNLP 2025) |
 | Refusal (empty content) | Log as refusal, skip batch, surface on /settings |
 
 ## 5. Knowledge
@@ -290,6 +304,9 @@ CREATE TABLE items (
   attachments TEXT,               -- JSON array of attachment URLs (e.g., Discord CDN image URLs)
   content_hash TEXT NOT NULL,
   content_anchor TEXT,            -- first 200 tokens of original content (set by pre-summarize for compressed items, used for embedding quality)
+  original_language TEXT,          -- ISO 639-3 code if non-English (e.g., 'ind'); NULL for English
+  translated BOOLEAN DEFAULT false, -- true if content was translated from another language
+  filter_reason TEXT,              -- reason for filtering (e.g., 'spam', 'injection_detected'); NULL if not filtered
   status TEXT DEFAULT 'ready',    -- ready | filtered | processing | processed
   batch_id TEXT,
   created_at INTEGER NOT NULL
@@ -333,6 +350,7 @@ CREATE TABLE entities (
   id TEXT PRIMARY KEY,
   name TEXT NOT NULL,
   type TEXT NOT NULL,              -- token | person | project | company | event
+  status TEXT NOT NULL DEFAULT 'active',  -- active | archived (two-tier memory: demote instead of delete)
   relevance REAL DEFAULT 0,
   first_seen INTEGER NOT NULL,
   last_seen INTEGER NOT NULL,
@@ -343,8 +361,10 @@ CREATE TABLE entities (
 **entity_aliases**
 ```sql
 CREATE TABLE entity_aliases (
-  alias TEXT PRIMARY KEY,          -- lowercase normalized
-  entity_id TEXT NOT NULL REFERENCES entities(id)
+  alias TEXT NOT NULL,             -- lowercase normalized
+  context_key TEXT NOT NULL DEFAULT '',  -- disambiguation context (e.g., 'defi', 'gaming'); empty = universal alias
+  entity_id TEXT NOT NULL REFERENCES entities(id),
+  PRIMARY KEY (alias, context_key)
 );
 ```
 
@@ -433,6 +453,23 @@ CREATE TABLE source_rate_history (
 
 Tracks expected message rate (lambda) per source, per hour-of-day, per day-of-week. Learned from last 7 days. Used by the Poisson-based claim gate for Discord sources (see Scheduler section).
 
+**narratives** (embedding-based narrative clustering)
+```sql
+CREATE TABLE narratives (
+  id TEXT PRIMARY KEY,              -- ULID
+  name TEXT NOT NULL,               -- 3-5 word theme name (Haiku-generated)
+  date DATE NOT NULL,
+  member_count INTEGER NOT NULL,    -- number of summaries in this cluster
+  avg_sentiment REAL,
+  signal_strength TEXT NOT NULL,    -- new | emerging | strong | stable | fading
+  summary_ids TEXT[] NOT NULL,      -- array of summary IDs in this cluster
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_narratives_date ON narratives(date DESC);
+```
+
+Narratives are detected daily before Stage 3 synthesis by clustering existing summary embeddings (k-means with auto-tuned k via silhouette score). Clusters with 3+ members are named by Haiku (~3-5 calls/day). Signal strength classified by comparing member count to previous day: 3x growth = strong, 1.5x = emerging, halved = fading. Fed to Sonnet as context in daily synthesis prompt, telling the model WHY trends are happening (not just WHAT entities and HOW sentiment).
+
 ### Schema Versioning
 
 A `schema_version` table tracks the current version. `migrations.ts` checks on startup, runs numbered migration functions in a transaction, bumps version. No external migration library needed.
@@ -449,7 +486,7 @@ CREATE TABLE IF NOT EXISTS schema_version (
 relevance = relevance * 0.95^days_since_update + log(1 + mentions) * source_weight
 ```
 
-Source weights: Discord=1.0, Twitter=1.5, News=2.0 (rarer = higher signal). Applied daily via cron.
+Source weights: Discord=1.0, Twitter=1.5, News=2.0 (rarer = higher signal). Applied daily via cron. Entities reaching `relevance < 0.01` after 90 days are archived (not deleted) — preserving history for reactivation if re-mentioned. Reports and correlation queries filter to `status = 'active'`; chat/search can access archived entities too.
 
 ### Data Retention
 
@@ -459,7 +496,7 @@ Daily cron after entity decay:
 - **Summaries**: keep 90 days.
 - **Reports**: keep forever (~1KB each).
 - **Entity mentions**: delete where `created_at < now - 90d`.
-- **Entities**: prune where `relevance < 0.01 AND last_seen < now - 90d`. Cascade deletes aliases and mentions.
+- **Entities**: archive (not delete) where `relevance < 0.01 AND last_seen < now - 90d AND status = 'active'`. Sets `status = 'archived'`. Archived entities preserve name, type, aliases, last sentiment, mention history. When an archived entity is re-mentioned, it promotes back to `active` with `relevance = 0.5` and full history intact.
 - At 5K items/day, 30-day retention caps `items` at ~150K rows.
 
 ### Backup
@@ -597,9 +634,17 @@ All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
 
 | Method | Path | Response |
 |--------|------|----------|
-| `POST` | `/api/v1/chat` | Body: `{ message: string, conversationId?: string }`. Response: `{ answer: string, sources: [{ type: string, id: string, snippet: string }], conversationId: string }` |
+| `POST` | `/api/v1/chat` | Body: `{ message: string, conversationId?: string }`. Response: `{ answer: string, sources: [{ type: string, id: string, snippet: string }], toolCalls?: [{ name: string, args: Record<string, unknown> }], conversationId: string }` |
 
-How it works: user question is embedded via Gemini (same model as all embeddings), cosine similarity finds top 10 relevant summaries/reports/items from the in-memory vector cache, those results plus last 5 messages of conversation history are passed to Sonnet as context, Sonnet generates an answer grounded in the retrieved data. Conversation history stored in memory (cleared on restart). Sonnet system prompt instructs: answer ONLY from provided context, cite sources, say "I don't have data on that" if no relevant results, never speculate beyond the data. Each chat message = 1 Gemini embedding call + 1 Sonnet call.
+How it works: Sonnet is given three retrieval tools and picks the right strategy per query (A-RAG pattern, Feb 2026):
+
+- **`semantic_search`** — search summaries/reports by meaning via Gemini embeddings + cosine similarity. For "what happened with X?" and topic queries. Params: `query`, `timeRange`, `limit`.
+- **`keyword_search`** — search entities by name, get mention counts, sentiment scores, source breakdown. For "how is sentiment on X?" and entity-specific queries. Params: `entity`, `timeRange`.
+- **`read_raw`** — read original source message by item ID. For verifying claims or getting exact quotes. Params: `itemId`.
+
+Indonesian queries are detected (franc) and translated to English via Haiku before embedding, so queries match the English embedding space correctly.
+
+Sonnet calls tools iteratively until it has enough context, then generates a grounded answer. Conversation history (last 5 messages) stored in memory (cleared on restart). Sonnet system prompt instructs: answer ONLY from provided context, cite sources, say "I don't have data on that" if no relevant results, never speculate beyond the data.
 
 **Vector retrieval details**: cosine similarity (standard for text embeddings). Retrieves top-10 results with no minimum similarity threshold -- Sonnet judges relevance from context rather than a hard cutoff. The vector cache is loaded into memory on startup from the `embeddings` table and rebuilt if the embedding model changes. Memory budget: ~50MB for 20K vectors x 768 dims x 4 bytes (Float32), well within VPS RAM. Conversation state is kept in-memory per session with no persistence across server restarts.
 
@@ -818,22 +863,34 @@ At 5,000 items/day post-normalization:
 
 | Component | Calls/day | Cost |
 |-----------|-----------|------|
-| Stage 0 (code) | — | $0 |
-| Stage 1 (Haiku, 12 batches) | ~30 | ~$0.05 |
-| Stage 2 (SQL) | 12 | $0 |
-| Stage 3 (Sonnet, daily + 8 pulse + rare flash) | 9-10 | ~$0.90 |
-| Chat (Sonnet, user-driven) | ~10-20 | ~$0.15-0.30 |
+| Stage 0 (code + InstructDetector) | — | $0 |
+| Indonesian translation (Haiku) | ~15-20 | ~$0.02-0.04 |
+| Stage 1 (Haiku, 12 batches, with budget hints) | ~30 | ~$0.03-0.04 |
+| Confidence routing escalation (Sonnet) | ~2-3 | ~$0.02-0.05 |
+| Stage 2 (SQL + trust weight calc) | 12 | $0 |
+| Narrative clustering (Haiku naming) | ~3-5 | ~$0.01 |
+| Entity disambiguation (Haiku, batched) | ~1-2 | ~$0.01 |
+| Synthesize — daily (Sonnet) | 1 | ~$0.05 |
+| Synthesize — flash (Sonnet, rare) | ~0-1 | ~$0.05 |
+| Pulse (Sonnet, every 3h) | 8 | ~$0.11 |
+| Chat (Sonnet, tool-based RAG, user-driven) | ~10-20 | ~$0.15-0.30 |
 | Twitter (twitterapi.io) | ~2K tweets | ~$0.30/day |
-| **Total** | | **~$1.55/day** |
+| Trust weight adjustment (SQL) | — | $0 |
+| Entity archival (SQL) | — | $0 |
+| **Total** | | **~$0.82-1.06/day (~$25-32/month)** |
+
+**Prompt caching**: Stage 1 system prompt (~2K tokens) is identical across ~50 daily Haiku calls. Anthropic caches repeated prefixes automatically — after the first call, ~90% savings on system prompt input tokens. Verify Pi AI passes through caching headers; if not, savings are ~$0.02/day lower. Net effect already reflected in Stage 1 estimate above.
 
 ## Build Order
 
-1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, source_rate_history, app_config, embeddings, health_events)
+1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, source_rate_history, app_config, embeddings, health_events, narratives)
 2. `llm.ts` wrapper (error taxonomy, retry, token counting)
 3. `embed.ts` wrapper (Gemini text-embedding-004, retry, cost logging)
 4. RSS ingestion (simplest source — `rss-parser` + normalize)
 5. Normalize pipeline (dedup, filter, language detection, truncation)
+5.5. InstructDetector integration (prompt injection scan in normalize, Unicode normalization, zero-width character stripping)
 6. Pre-summarize (Haiku compression for low-density RSS/news)
+6.5. Indonesian translation in normalize (Haiku, language-gated, before saving as ready)
 7. Stage 1 summarize (entities as JSON in summary body, no separate tables) + summary embedding (inline after Stage 1)
 8. Stage 3 synthesize + report generation + report embedding (inline after Stage 3)
 9. Market pulse (Sonnet, 3h cron, scaled output, Discord webhook with muted grey embed)
@@ -841,7 +898,7 @@ At 5,000 items/day post-normalization:
 11. Scheduler (cron jobs + pulse cron + mutex + crash recovery)
 12. In-memory vector cache for summaries + reports (load on startup)
 13. Semantic search endpoint (`GET /api/v1/search?mode=semantic`)
-14. RAG chat endpoint (`POST /api/v1/chat`) — embed question via Gemini, retrieve top 10 from vector cache, pass to Sonnet with conversation history, return grounded answer with source citations
+14. RAG chat endpoint (`POST /api/v1/chat`) — three-tool model (semantic_search, keyword_search, read_raw). Sonnet picks retrieval strategy per query. Indonesian queries translated before embedding. Conversation history in memory
 15. Discord ingestion + source_state + Gateway multi-token + Poisson claim gate (`source_rate_history`)
 16. Twitter/X via twitterapi.io
 17. News article extraction (Readability)
@@ -850,9 +907,11 @@ At 5,000 items/day post-normalization:
 
 Steps 15-17 are independent and can be built in parallel.
 
-20. Entity tables (entities, entity_aliases, entity_mentions) + resolution from summary JSON
+20. Entity tables (entities, entity_aliases with context_key, entity_mentions) + three-tier resolution from summary JSON
 21. CoinGecko seeding + Indonesian entity seeds
-22. Entity relevance decay + pruning cron
+22. Entity relevance decay + archival cron (archive instead of delete, reactivation on re-mention)
+22.5. Trust weight auto-adjustment (SQL, runs 1h after each flash alert, ±0.2 bounds from initial weight)
+22.6. Narrative clustering (k-means on summary embeddings, Haiku naming, signal strength classification, narratives table)
 23. Item embedding (batch cron every 15 min) + entity embedding (inline on create/update)
 24. Postgres full-text search (tsvector/tsquery) + search endpoint (keyword fallback)
 25. `llm_usage` table + cost tracking

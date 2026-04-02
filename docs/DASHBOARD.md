@@ -322,6 +322,10 @@ Triggered by `+ Add Source` > Discord. Calls `GET /api/v1/sources/discover/disco
 |  | rss/thedefiant  | disabled | 3d ago       | 5                |  |
 |  +--------------------------------------------------------------+  |
 |                                                                    |
+|  INJECTION-FILTERED ITEMS                                          |
+|  Today: 2 items filtered  [View]                                   |
+|  (Items flagged by InstructDetector — review for false positives)  |
+|                                                                    |
 |  FAILED DELIVERIES                                                 |
 |  +--------------------------------------------------------------+  |
 |  | Mar 28 Daily    | 401 Unauthorized        | [Retry]          |  |
@@ -515,6 +519,7 @@ RAG chat interface. User asks questions about their data, Sonnet answers grounde
 - Input field auto-focuses on page load. Enter key sends, Shift+Enter for newline.
 - Loading state: animated dots ("...") in a Podders message bubble while waiting for response.
 - Empty state: "Ask a question about your market data. Podders will search your summaries, reports, and items to find the answer."
+- Tool usage indicators: when Sonnet uses a retrieval tool (semantic_search, keyword_search, read_raw per Decision 07), display a subtle inline indicator (e.g., "Searched summaries..." or "Looked up ETH entity...") above the response while loading, then collapse into the source citations. This shows the user what retrieval strategy was used without cluttering the final response.
 
 ---
 

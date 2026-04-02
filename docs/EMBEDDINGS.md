@@ -179,6 +179,15 @@ User query: "what did people say about Solana staking?"
 
 This replaces Postgres full-text search as the primary search mechanism. tsvector/tsquery stays as a fallback for exact keyword matches ("FOMC" -- you want exact match, not semantic).
 
+Semantic search is now one of three retrieval tools available to the RAG chat
+feature (Decision 07). Sonnet selects the appropriate tool per query:
+- `semantic_search` — embedding-based search against summaries/reports (this section)
+- `keyword_search` — entity lookup via the entities table (mention counts, sentiment)
+- `read_raw` — read original source messages by ID for verification/quotes
+
+Sonnet picks the right tool (or combination) per query. Simple entity lookups use
+keyword_search; thematic questions use semantic_search; verification uses read_raw.
+
 **API endpoint**: extend `GET /api/v1/search` to accept `mode=semantic|keyword`
 (default: semantic). Keyword mode uses tsvector/tsquery. Semantic mode uses embeddings.
 

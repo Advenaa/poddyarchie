@@ -7,18 +7,21 @@ Visual navigation doc. ASCII diagrams showing every data flow in the system.
 ## 1. Main Pipeline Flow
 
 ```
- SOURCES                 INGEST              NORMALIZE (Stage 0, no LLM)
+ SOURCES                 INGEST              NORMALIZE (Stage 0, Haiku for Ind→EN only)
 +----------+          +----------+          +-------------------+
 | Discord  |--ws----->|          |          |                   |
 | Twitter  |--poll--->| RawItem  |--------->| Truncate (20K ch) |
-| RSS      |--poll--->| { id,    |          | Dedup (sha256)    |
-| News     |--manual->|   source,|          | URL expand+dedup  |
-|          |          |   content|          | Spam filter       |
-+----------+          |   engag. |          | Language detect    |
-                      |   ... }  |          +---+----------+----+
-                      +----------+              |          |
+| RSS      |--poll--->| { id,    |          | Unicode NFC       |
+| News     |--manual->|   source,|          | InstructDetector  |
+|          |          |   content|          | Dedup (sha256)    |
++----------+          |   engag. |          | URL expand+dedup  |
+                      |   ... }  |          | Spam filter       |
+                      +----------+          | Language detect    |
+                                            | Ind→EN translate* |
+                                            +---+----------+----+
+                                                |          |
                                            'filtered'   'ready'
-                                           (kept for     (full content)
+                                           (kept for     (English content)
                                             debug)          |
                                                             v
                                             PRE-SUMMARIZE (Haiku)
@@ -28,6 +31,9 @@ Visual navigation doc. ASCII diagrams showing every data flow in the system.
                                             |   compress ~300tok|
                                             |   no → pass thru  |
                                             +--------+----------+
+
+ *Ind→EN translate: Haiku call only for Indonesian content (Decision 01).
+  InstructDetector: prompt injection scan, cached per item (Decision 06).
                                                      |
                                                      v
  STAGE 1 (Haiku, per-source intervals)         +-------------------+
@@ -36,36 +42,54 @@ Visual navigation doc. ASCII diagrams showing every data flow in the system.
 |  Sources processed in parallel               |  status='ready')  |
 |  Author cap (20% max per author)             +-------------------+
 |  Topic-aware chunking (6K token budget)
+|  Budget hints: sparse chunks get "~400 tok" hint (Decision 03)
 |  Haiku call per chunk (JSON output)               |
 |  Zod parse -> entity post-verify -> quality gate  |
-|                                                   v
-|  Output per chunk:                       +-----------------+
-|    ChunkSummary {                        | summaries table |
-|      summary, urgency,                   | (body = JSON)   |
-|      entities[], keyEvents[]             +-----------------+
+|  Confidence < 5 + non-routine → escalate to       |
+|    Sonnet (Decision 10)                            v
+|                                          +-----------------+
+|  Output per chunk:                       | summaries table |
+|    ChunkSummary {                        | (body = JSON)   |
+|      summary, urgency,                   +-----------------+
+|      confidence (1-10),                       |
+|      entities[], keyEvents[]                  |
 |    }                                          |
 +-----------------------------------------------+
       |                    |
       v                    v
- STAGE 2 (SQL)        FLASH CHECK
-+---------------+     +---------------------+
-| correlate.run |     | urgency='breaking'? |
-| entities in   |     | 2+ sources OR       |
-| 2+ sources    |     | 3+ chunks w/in 30m? |
-| within 24h    |     +----------+----------+
-+-------+-------+                |yes
-        |                        v
+ STAGE 2 (SQL)        FLASH CHECK (Decision 02)
++---------------+     +---------------------------+
+| correlate.run |     | urgency='breaking'?        |
+| entities in   |     | weighted trust sum >= 1.5   |
+| 2+ sources    |     | (not just 2+ sources)       |
+| within 24h    |     | High-trust src (1.0) can    |
++-------+-------+     |   fire alone; 3 low-trust   |
+        |              |   (0.5 ea) also fires       |
+        |              +-------------+---------------+
+        |                            |yes
+        |                            v
         |              STAGE 3 FLASH (Sonnet)
         |              scope: last 4h
         |              +---> MarketReport (type='flash')
         |                       |
         v                       v
+ NARRATIVE CLUSTERING (Decision 05)
++--------------------------------------+
+| k-means on summary embeddings        |
+| Auto-tune k (3-10, silhouette score) |
+| Haiku names each cluster (3-5 words) |
+| Signal: new/emerging/strong/fading   |
+| Cost: ~$0.01/day (3-5 Haiku calls)   |
++-------------------+------------------+
+                    |
+                    v
  STAGE 3 DAILY (Sonnet, at digest_time)    DELIVERY
 +--------------------------------------+   +--------------------+
 | Reads: summaries (prev calendar day) |   |                    |
 |        correlated entities           |-->| webhook.deliver()  |
 |        yesterday's TL;DR             |   | Discord embed POST |
-|        raw exemplars (7 engagement   |   | 3 retries (2/8/32s)|
+|        narrative clusters (Decis 05) |   | 3 retries (2/8/32s)|
+|        raw exemplars (7 engagement   |   |                    |
 |          + 3 RSS/news reserved)      |   |                    |
 | If >50 summaries: rank, take top 30  |   |                    |
 | Quality gate: skip if no key events  |   | reports.delivery_  |
@@ -94,8 +118,9 @@ Source event     RawItem          items row        ChunkSummary       Correlated
 (ws/http)    --> (in-memory)  --> (Postgres)   --> (summaries.body)-> (in-memory)     --> (reports.body)
                  id: ulid         status: ready    summary: text      name: string        tldr: string
                  source: enum     content_hash     urgency: enum      sources: string[]   keyEvents[]
-                 content: text    engagement: int  entities: json[]   avg_sentiment       sections[]
-                 engagement: num  batch_id: null   keyEvents: str[]   source_count        entitySentiment[]
+                 content: text    engagement: int  confidence: 1-10   avg_sentiment       sections[]
+                 engagement: num  batch_id: null   entities: json[]   source_count        entitySentiment[]
+                 metadata.translated?              keyEvents: str[]                       narratives[]
 ```
 
 ---
@@ -184,8 +209,10 @@ News     ---- manual URL submit ------> article_url        on-demand        long
 
 * Pre-summarize runs as its own step after normalize, not inside normalize.
 
-Shared normalize steps (all sources, no LLM):
-  Truncate >20K chars | Spam filter (en+id rules) | Language detect (eng/ind only) | URL expand
+Shared normalize steps (all sources, Haiku for Ind→EN translation only):
+  Truncate >20K chars | Unicode NFC + zero-width strip | InstructDetector scan (Decision 06)
+  Dedup (sha256) | URL expand+dedup | Spam filter (en+id rules) | Language detect (eng/ind only)
+  Ind→EN translate via Haiku if Indonesian (Decision 01)
 ```
 
 ---
@@ -226,9 +253,17 @@ RELEVANCE = relevance * 0.95^days + log(1+mentions) * source_weight
   Decay cron: daily 00:00 UTC (relevance *= 0.95)
   Boost: real-time during Stage 1 entity upsert
 
-LIFECYCLE: Day 0 ~2.0 -> Day 7 ~1.4 -> Day 30 ~0.43 -> Day 90 <0.01 -> PRUNED
-  Prune condition: relevance < 0.01 AND last_seen > 90d ago
-  Cascade: delete aliases + mentions + entity row
+LIFECYCLE (Decision 04 — two-tier active/archived):
+  Day 0 ~2.0 -> Day 7 ~1.4 -> Day 30 ~0.43 -> Day 90 <0.01 -> ARCHIVED (not deleted)
+
+  Status transitions:
+    ACTIVE ──(relevance < 0.01 AND last_seen > 90d)──> ARCHIVED
+    ARCHIVED ──(re-mentioned in Stage 1)──> ACTIVE (relevance reset to 0.5)
+
+  Archived entities preserve: name, type, aliases, last sentiment, mention count, timestamps
+  Reports/correlation: WHERE status = 'active' (only active entities appear)
+  Chat/search: no status filter (can find archived entities too)
+  Dashboard: archived entities shown in separate "inactive" section
 
 DISAMBIGUATION: UNIQUE(name, type) -- same name can be token AND company
   Alias collision: ON CONFLICT DO NOTHING (first writer wins)
@@ -243,9 +278,10 @@ DISAMBIGUATION: UNIQUE(name, type) -- same name can be token AND company
   ~~~~~~~~~~~~                                    ~~~~~~~~~~~~
   Inputs:                                         Trigger:
     summaries (prev calendar day)                   Stage 1 returns urgency:'breaking'
-    correlated entities (24h)                       Corroboration: 2+ sources OR 3+ chunks within 30 minutes
-    yesterday's TL;DR (temporal anchor)             (single chunk = log only, no flash)
-    raw exemplars (7 engagement
+    correlated entities (24h)                       Corroboration: weighted trust sum >= 1.5 (Decision 02)
+    narrative clusters (Decision 05)                  High-trust source (1.0) can fire alone
+    yesterday's TL;DR (temporal anchor)               3 default sources (0.5 ea) also fires
+    raw exemplars (7 engagement                       (single chunk below threshold = log only)
       + 3 RSS/news reserved)                      Scope: last 4h summaries only
   Guards:                                         Guards:
     quality gate (skip if 0 events+entities)        cooldown: 30min between flashes
@@ -289,6 +325,14 @@ DISAMBIGUATION: UNIQUE(name, type) -- same name can be token AND company
 Webhook embed: daily = title + TL;DR + events + sentiment + coverage + report link
                flash = [FLASH] prefix + 2-sentence TL;DR + 1 section max
                pulse = muted grey (0x4A4A5A) + "Market Pulse — HH:MM WIB" title
+
+TRUST WEIGHT LIFECYCLE (Decision 02)
+  Source created → manual trust_weight set (default 0.5)
+  Scale: 1.0 high (Reuters) | 0.7 mid (CoinDesk) | 0.5 default | 0.3 low | 0.1 near-zero
+  Auto-adjust: 1 hour after each flash alert
+    confirmed by other sources → weight += 0.05 (capped at initial + 0.2)
+    unconfirmed              → weight -= 0.03 (floored at initial - 0.2)
+  Manual weight sets the floor/ceiling — system nudges ±0.2 but never overrides
 ```
 
 ---
@@ -318,13 +362,29 @@ ENTITY + REPORT EMBEDDING (inline, on create/update)
   Entity upsert  ---> Gemini (~30 tok)  ---> embeddings target:'entity' (in-memory cache)
   Stage 3 output ---> Gemini (~400 tok) ---> embeddings target:'report' (in-memory cache)
 
-QUERY FLOW (semantic search)
-+-------------+     +-----------+     +------------------+     +---------+
-| User query  |     | Embed the |     | Cosine similarity|     | Top 10  |
-| "solana     |---->| query     |---->| vs in-memory     |---->| results |
-|  staking"   |     | string    |     | summary/report   |     | > 0.3   |
-+-------------+     +-----------+     | vectors (~3K)    |     | thresh  |
-                                      +------------------+     +---------+
+NARRATIVE CLUSTERING (daily, before Stage 3 — Decision 05)
++------------------+     +-------------------+     +------------------+
+| Summary vectors  |     | k-means clustering|     | Haiku names each |
+| from last 24h    |---->| k=3-10 (silhouette|---->| cluster (3-5     |
+| (in-memory)      |     |   auto-tune)      |     | words, ~20 tok)  |
++------------------+     +-------------------+     +--------+---------+
+                                                            |
+                          +-------------------+             v
+                          | narratives table  |<--- Signal: new/emerging/
+                          | name, date,       |     strong/stable/fading
+                          | signal_strength   |     (growth vs yesterday)
+                          +-------------------+
+
+QUERY FLOW (semantic search — Decision 11)
++-------------+     +-----------+     +-----------+     +------------------+     +---------+
+| User query  |     | Language   |     | Embed the |     | Cosine similarity|     | Top 10  |
+| "solana     |---->| detect     |---->| query     |---->| vs in-memory     |---->| results |
+|  staking"   |     | (franc)    |     | string    |     | summary/report   |     | > 0.3   |
++-------------+     | Ind→EN?   |     +-----------+     | vectors (~3K)    |     | thresh  |
+                    | translate  |                       +------------------+     +---------+
+                    +-----------+
+Indonesian queries translated to English via Haiku before embedding (Decision 11).
+All embeddings are English — English query ↔ English vectors = best similarity.
 
 SEMANTIC DEDUP (in normalize)
   New item -> embed -> cosine vs last 24h (same source type)
@@ -335,4 +395,38 @@ STORAGE (30 days, 5K items/day): ~450MB items + ~9MB summaries/entities/reports
   Item embeddings deleted alongside items (30-day TTL)
 
 COST: ~$0/day (free tier: 1500 req/day) at 5K items/day
+```
+
+---
+
+## 7. RAG Chat Data Flow (Decision 07)
+
+```
+USER QUERY                        TOOL SELECTION (Sonnet)              BACKENDS
++-------------------+            +-------------------------+
+| "What happened    |            | Sonnet picks tool(s)    |
+|  with SOL?"       |---+        | per query:              |
++-------------------+   |        |                         |
+                        |        | semantic_search --------+---> Gemini embeddings
+  Indonesian query?     |        |   topic/theme questions |     cosine vs summaries/reports
+  yes → Haiku translate |        |   "what happened with?" |     top 10 > 0.3 threshold
+  (Decision 11)         |        |                         |
+                        +------->| keyword_search ---------+---> Postgres entities table
+                                 |   sentiment, mentions   |     entity_mentions join
+                                 |   "how is sentiment?"   |     source breakdown
+                                 |                         |
+                                 | read_raw ---------------+---> items table
+                                 |   verify claims, quotes |     full content + metadata
+                                 +----------+--------------+
+                                            |
+                                            v
+                                 +-------------------------+
+                                 | Sonnet synthesizes      |
+                                 | answer from tool results|
+                                 | (iterative tool calls   |
+                                 |  if multi-hop question) |
+                                 +-------------------------+
+
+  Cost: same as current chat (~$0.15-0.30/day). Tool calls are function executions, not LLM calls.
+  Chat history: maintained per session. Dialogue context improves retrieval accuracy.
 ```

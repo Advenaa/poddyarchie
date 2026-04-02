@@ -25,6 +25,33 @@
 - Stage 3 split (separate extraction vs. narrative sub-stages)
 - Structured-only Stage 1 (drop prose summary, keep only structured fields)
 
+## Indonesian Translation (after Normalize, before Pre-summarize)
+
+A pre-translation step for Indonesian content. English content passes through unchanged. This runs after normalize (which already detects language via franc) and before pre-summarize.
+
+**Why**: Research shows 14-17 percentage point accuracy loss when LLMs process low-resource languages (Bahasa Indonesia) directly vs English input. The XBridge architecture (Mar 2026) proved translate-in, reason in English, translate-out outperforms single-pass multilingual. Selective pre-translation (Jul 2025) is optimal -- don't translate everything, only what needs it.
+
+**When**: Normalize step, after language detection, before saving as `ready`.
+
+```typescript
+// In normalize pipeline, after language detection
+if (detectedLanguage === 'ind') {
+  const translated = await llm.call({
+    model: config.models.haiku,
+    system: 'Translate the following Indonesian text to English. Preserve all entity names, numbers, and technical terms. Output only the translation.',
+    prompt: item.content,
+    maxTokens: Math.ceil(item.content.length / 4) * 1.5 // ~1.5x input for translation
+  });
+  item.content = translated.text;
+  item.metadata.originalLanguage = 'ind';
+  item.metadata.translated = true;
+}
+```
+
+**Schema**: No new tables. Add optional metadata fields `originalLanguage` and `translated` to items for tracking.
+
+**Cost**: ~15-20 extra Haiku calls/day for Indonesian content. ~$0.02-0.04/day ($0.60-1.20/month). Total system cost increase: ~3-5%.
+
 ## Pre-summarize (after Normalize, before Stage 1)
 
 A separate LLM step between normalize and Stage 1. Equalizes signal density across source types — a 10K-char news article otherwise dominates a chunk's token budget while carrying the same signal as a 500-char Discord thread. This is an LLM call and does not belong in normalize, which is pure rule-based (truncate, dedup, URL dedup, spam filter, language detect).
@@ -77,12 +104,12 @@ function shouldSkipPreSummary(item: ReadyItem): boolean {
 
 **Regulatory variant** (articles matching regulatory/policy keywords):
 ```
-Summarize these regulatory/policy articles for a market analyst. Preserve: exact rule numbers, effective dates, affected entities, penalties, and quoted official statements. Drop background explainers. Content may be in English or Indonesian. Output in English.
+Summarize these regulatory/policy articles for a market analyst. Preserve: exact rule numbers, effective dates, affected entities, penalties, and quoted official statements. Drop background explainers. Content is in English (Indonesian content has been pre-translated). Output in English.
 ```
 
 **General news variant** (everything else):
 ```
-Summarize these news articles for a market analyst. Preserve: all named entities, numbers, quotes, dates, and causal claims. Drop boilerplate, author bios, and filler paragraphs. Content may be in English or Indonesian. Output in English.
+Summarize these news articles for a market analyst. Preserve: all named entities, numbers, quotes, dates, and causal claims. Drop boilerplate, author bios, and filler paragraphs. Content is in English (Indonesian content has been pre-translated). Output in English.
 ```
 
 ### Batched Calls
@@ -98,8 +125,8 @@ async function preSummarizeBatch(items: ReadyItem[]): Promise<Map<string, string
   for (const batch of batches) {
     const isRegulatory = batch.some(i => /regulat|OJK|SEC|CFTC|policy|rule|compliance/i.test(i.content));
     const systemPrompt = isRegulatory
-      ? 'Summarize these regulatory/policy articles for a market analyst. Preserve: exact rule numbers, effective dates, affected entities, penalties, and quoted official statements. Drop background explainers. Content may be in English or Indonesian. Output in English.'
-      : 'Summarize these news articles for a market analyst. Preserve: all named entities, numbers, quotes, dates, and causal claims. Drop boilerplate, author bios, and filler paragraphs. Content may be in English or Indonesian. Output in English.';
+      ? 'Summarize these regulatory/policy articles for a market analyst. Preserve: exact rule numbers, effective dates, affected entities, penalties, and quoted official statements. Drop background explainers. Content is in English (Indonesian content has been pre-translated). Output in English.'
+      : 'Summarize these news articles for a market analyst. Preserve: all named entities, numbers, quotes, dates, and causal claims. Drop boilerplate, author bios, and filler paragraphs. Content is in English (Indonesian content has been pre-translated). Output in English.';
 
     const batchedContent = batch.map((item, idx) =>
       `---[${idx + 1}]---\n${item.content.slice(0, 16000)}`
@@ -184,6 +211,7 @@ Return ONLY valid JSON matching this schema:
 {
   "summary": "200-500 word summary of key discussion themes and events",
   "urgency": "routine" | "elevated" | "breaking",
+  "confidence": 1-10,
   "entities": [
     {
       "name": "Canonical form (e.g. 'Ethereum' not 'ETH')",
@@ -202,9 +230,35 @@ Rules:
 - urgency: "breaking" = major exploit, crash, regulatory action, protocol failure, central bank rate decisions (Fed, BI, ECB), exchange circuit breakers (IHSG/IDX halt), flash crashes (>5% index move in <1h). "elevated" = notable but not urgent. "routine" = normal discussion.
 - keyEvents: factual only, no speculation. Include source attribution when possible.
 - Do not summarize spam, greetings, or off-topic chatter. If the entire batch is spam/noise, return: {"summary": "No substantive discussion in this window.", "urgency": "routine", "entities": [], "keyEvents": []}
-- Content may be in English or Indonesian (Bahasa Indonesia). Always output in English regardless of input language.
+- Content is in English. Indonesian content has been pre-translated to English before this stage. Always output in English.
+- Rate your confidence in this summary from 1-10:
+  - 10: Clear, unambiguous content. All entities identified. Sentiment obvious.
+  - 5: Some uncertainty. Mixed signals, unfamiliar entities, or conflicting information.
+  - 1: Very uncertain. Content is confusing, contradictory, or in an unfamiliar domain.
 - For Indonesian regulatory bodies and institutions, keep the local acronym and add an English gloss on first mention: "OJK (Indonesia Financial Services Authority)". Translate slang and colloquialisms to standard English market terminology.
 ```
+
+### Budget Hints (Complexity-Adaptive)
+
+Most chunks are routine — Haiku over-generates tokens on simple inputs (OckBench ICLR 2026 showed 2-5x over-generation). Budget hints are appended to the system prompt based on chunk density:
+
+```typescript
+const isDense = chunk.estimatedEntities > 5
+  || chunk.tokenCount > 4000
+  || chunk.hasUrgencyKeywords;
+
+const budgetHint = isDense
+  ? '' // no constraint — let Haiku write freely
+  : 'Target ~400 tokens for the summary field. Be concise.';
+
+const systemPrompt = STAGE1_SYSTEM_PROMPT + (budgetHint ? `\n\n${budgetHint}` : '');
+```
+
+~70% of chunks are routine and get the concise hint. Output drops from ~1000 tokens to ~400 tokens on those chunks. Since output tokens cost 5x input tokens on Haiku, this saves ~30-40% on Stage 1 output token costs (~$0.15/day to ~$0.10/day).
+
+### Prompt Caching
+
+The Stage 1 system prompt (~2000 tokens) is identical across all ~50 daily Haiku calls. Anthropic enables prompt caching automatically for repeated prefixes. After the first call, subsequent calls pay ~90% less for the system prompt tokens. Verify that Pi AI passes through caching headers (see Prompt Caching Verification subsection below).
 
 ### Few-Shot Examples (included in prompt)
 
@@ -275,7 +329,48 @@ Parse with zod. Enforce:
 - `type` must be valid enum — default unknown to `"project"`
 - `entities` array max 20 per chunk
 - `keyEvents` max 5
-- If JSON parse fails, retry once with a FRESH prompt (do NOT include the failed response in retry context — prevents injection amplification)
+
+Two distinct failure modes with different retry strategies:
+
+1. **JSON parse failure** (malformed JSON): retry once with a FRESH prompt. Do NOT include the failed response in retry context -- prevents injection amplification.
+2. **Zod validation failure** (valid JSON, wrong shape/values): use error-path feedback retry (see below).
+
+### Error-Path Feedback Retry
+
+When zod validation fails, extract specific error paths and include them in the retry prompt so Haiku knows exactly what to fix. Research (PARSE, EMNLP 2025) showed 92% error reduction with this approach vs generic "try again" retries.
+
+```typescript
+if (!zodResult.success) {
+  const errorMessages = zodResult.error.issues.map(issue =>
+    `- ${issue.path.join('.')}: ${issue.message} (received: ${JSON.stringify(issue.received)})`
+  ).join('\n');
+
+  const retryResponse = await llm.call({
+    model: config.models.haiku,
+    system: STAGE1_SYSTEM_PROMPT,
+    prompt: `Your previous output had these validation errors:
+${errorMessages}
+
+Fix ONLY these fields. Keep everything else the same.
+
+Original input:
+${chunk.content}`,
+    maxTokens: 3000
+  });
+}
+```
+
+Example error feedback sent to Haiku:
+```
+Your previous output had these validation errors:
+- entities[12].sentiment: Expected number <= 1.0, received 5.0
+- keyEvents: Expected array with max 5 items, received 8 items
+- summary: Expected string with min length 50, received ""
+
+Fix ONLY these fields. Keep everything else the same.
+```
+
+**Security note**: the error messages are generated from zod output (our code), not from the LLM response. No injection vector. The original chunk content is re-sent as context but is already sanitized (XML nonce tags).
 
 ### Entity Post-Verification
 
@@ -292,6 +387,72 @@ function verifyEntities(entities: Entity[], rawText: string): Entity[] {
 ```
 
 Drop hallucinated entities that don't appear in the chunk.
+
+### Entity Disambiguation
+
+After entity post-verification, resolve ambiguous entity names through a three-tier pipeline. Rule-based handles 95% of entities instantly; the remaining ambiguous cases use context and batched LLM calls.
+
+**Tier 1: Rule-Based Alias Lookup (existing)**
+```typescript
+async function resolveEntity(name: string, context: string[]): Promise<Entity> {
+  const normalized = name.toLowerCase().trim();
+  const alias = await lookupAlias(normalized);
+  if (alias && alias.candidates.length === 1) {
+    return alias.candidates[0]; // unambiguous match
+  }
+  // ... continue to Tier 2
+}
+```
+
+**Tier 2: Context-Based Disambiguation (free)**
+
+Use co-occurring entities from the same chunk as context. Research (DeepEL, Nov 2025) showed co-occurring entities resolve ambiguity for free -- "Wormhole" + "bridge" + "exploit" = DeFi protocol.
+
+```typescript
+if (alias && alias.candidates.length > 1) {
+  const coEntities = context; // other entity names from same chunk
+  for (const candidate of alias.candidates) {
+    const candidateAliases = await getEntityAliases(candidate.id);
+    const contextOverlap = coEntities.filter(e =>
+      candidateAliases.some(a => a.relatedEntities?.includes(e))
+    );
+    if (contextOverlap.length >= 2) {
+      return candidate; // context strongly suggests this candidate
+    }
+  }
+}
+```
+
+**Tier 3: Batched LLM Disambiguation**
+
+Collect all ambiguous entities from the processing cycle, then disambiguate in one Haiku call. Each resolution is saved as a new context-aware alias for future rule-based lookups (self-improving).
+
+```typescript
+const ambiguousEntities: AmbiguousEntity[] = [];
+
+// ... after all chunks processed, disambiguate in one call
+if (ambiguousEntities.length > 0) {
+  const prompt = ambiguousEntities.map((e, i) =>
+    `${i+1}. "${e.name}" in context: "${e.surroundingText.slice(0, 200)}"
+    Candidates: ${e.candidates.map(c => `${c.name} (${c.type})`).join(', ')}`
+  ).join('\n\n');
+
+  const response = await llm.call({
+    model: config.models.haiku,
+    system: 'For each ambiguous entity mention, select the correct candidate based on context. Output JSON array: [{"index": 1, "selected": "candidate name"}]',
+    prompt,
+    maxTokens: ambiguousEntities.length * 50
+  });
+
+  // Save results as new aliases
+  for (const resolution of parsed) {
+    const entity = ambiguousEntities[resolution.index - 1];
+    await insertAlias(entity.name, entity.contextKey, resolution.selectedId);
+  }
+}
+```
+
+**Cost**: Day 1: ~5-10 ambiguous entities, 1-2 batched Haiku calls, ~$0.01/day. Month 2+: most ambiguities resolved via cached aliases, ~0-1 Haiku calls/day.
 
 ### Haiku Output Quality Gate
 
@@ -334,6 +495,119 @@ function deduplicateKeyEvents(
 
 Group events by Levenshtein similarity (threshold: 0.7). Collapse duplicates into a single event string, keeping source attribution from all instances. This prevents Sonnet from seeing the same event repeated from multiple chunks and over-weighting it.
 
+### Confidence-Based Escalation to Sonnet
+
+After Stage 1 processing, check Haiku's self-reported confidence to decide whether the chunk needs Sonnet re-processing. Research (Dynamic Model Routing Survey, Mar 2026) shows cascading is the standard; self-reported confidence (Mar 2026) is the cheapest and best-calibrated routing signal.
+
+```typescript
+const stage1Result = await processWithHaiku(chunk);
+
+const shouldEscalate = stage1Result.confidence < 5
+  && stage1Result.urgency !== 'routine';
+
+if (shouldEscalate) {
+  logger.info(`Escalating chunk ${chunk.id} to Sonnet (confidence: ${stage1Result.confidence}, urgency: ${stage1Result.urgency})`);
+  const sonnetResult = await processWithSonnet(chunk);
+  return sonnetResult;
+}
+
+return stage1Result;
+```
+
+**Why confidence < 5 AND urgency != "routine"**:
+- Low confidence + routine = boring chunk Haiku couldn't parse well. Doesn't matter.
+- High confidence + breaking = Haiku is sure about something important. Trust it.
+- Low confidence + elevated/breaking = Haiku is unsure about something important. This is the danger zone. Escalate.
+
+**Cost**: ~2-3 escalations/day x one Sonnet call (~$0.01 each) = $0.02-0.05/day (~$0.60-1.50/month).
+
+## Narrative Clustering (before Stage 3 Daily)
+
+Cluster existing summary embeddings to detect emerging narratives. We already embed every summary with Gemini -- vectors are sitting unused for this purpose. One Haiku call per cluster to name it. Track cluster growth for weak/strong signal classification.
+
+**When**: Daily synthesis job, before Sonnet writes the report. Load recent summary embeddings, cluster, name clusters, feed to Sonnet as context.
+
+### Clustering Logic
+
+```typescript
+import { kmeans } from 'ml-kmeans';
+
+async function detectNarratives(summaries: Summary[]): Promise<Narrative[]> {
+  const vectors = summaries.map(s => s.embedding);
+
+  // Auto-tune k using silhouette score
+  let bestK = 3;
+  let bestScore = -1;
+  for (let k = 3; k <= Math.min(10, Math.floor(summaries.length / 3)); k++) {
+    const result = kmeans(vectors, k);
+    const score = silhouetteScore(vectors, result.clusters);
+    if (score > bestScore) { bestScore = score; bestK = k; }
+  }
+
+  const clusters = kmeans(vectors, bestK);
+
+  // Name each cluster with 3+ members
+  const narratives: Narrative[] = [];
+  for (const cluster of clusters.filter(c => c.members.length >= 3)) {
+    const sampleSummaries = cluster.members.slice(0, 5).map(i => summaries[i].summary);
+    const name = await llm.call({
+      model: config.models.haiku,
+      system: 'Given these related market summaries, name the theme in 3-5 words. Output only the name.',
+      prompt: sampleSummaries.join('\n---\n'),
+      maxTokens: 20
+    });
+    narratives.push({
+      name: name.text.trim(),
+      memberCount: cluster.members.length,
+      avgSentiment: avg(cluster.members.map(i => summaries[i].avgSentiment)),
+      summaryIds: cluster.members.map(i => summaries[i].id)
+    });
+  }
+  return narratives;
+}
+```
+
+### Signal Classification
+
+```typescript
+function classifySignal(narrative: Narrative, previousDay?: Narrative): SignalStrength {
+  if (!previousDay) return 'new';
+  const growth = narrative.memberCount / previousDay.memberCount;
+  if (growth >= 3.0) return 'strong'; // 3x growth = strong signal
+  if (growth >= 1.5) return 'emerging'; // 1.5x = emerging
+  if (growth <= 0.5) return 'fading'; // halved = fading
+  return 'stable';
+}
+```
+
+### Daily Report Integration
+
+Feed to Sonnet in the daily synthesis prompt as structured context:
+```
+Emerging narratives detected:
+- "RWA Rotation" (12 summaries, +300% vs yesterday, STRONG signal)
+- "Memecoin Season Cooling" (5 summaries, -40% vs yesterday, FADING)
+- "Indonesian Regulatory Shift" (3 summaries, NEW)
+```
+
+### Schema
+
+```sql
+CREATE TABLE narratives (
+  id TEXT PRIMARY KEY, -- ULID
+  name TEXT NOT NULL,
+  date DATE NOT NULL,
+  member_count INTEGER NOT NULL,
+  avg_sentiment REAL,
+  signal_strength TEXT NOT NULL, -- new, emerging, strong, stable, fading
+  summary_ids TEXT[] NOT NULL,
+  created_at INTEGER NOT NULL
+);
+CREATE INDEX idx_narratives_date ON narratives(date DESC);
+```
+
+**Cost**: 3-5 Haiku calls/day x ~200 tokens each = ~$0.01/day. Negligible.
+
 ## Stage 3: Synthesize (Sonnet)
 
 ### System Prompt
@@ -366,6 +640,10 @@ Rules:
 - When multiple elevated or breaking events share entities or temporal proximity, explicitly state the causal chain or connection between them.
 - Do not assume causation from entity co-occurrence alone — only connect events when the relationship is evident from the source data.
 - Flag cross-entity ripple effects (e.g., bridge exploit → token sell-off → DeFi TVL drop) as a connected sequence, not isolated events.
+- Narrative clusters are provided as detected themes with signal strength. Reference STRONG and NEW narratives in sections. FADING narratives are context only — mention if relevant but don't lead with them.
+
+Detected narratives:
+{narratives}
 
 Yesterday's TL;DR for temporal context:
 {yesterdayTldr}
@@ -379,6 +657,7 @@ If yesterday was a flash report (single-event, narrow scope), do not treat it as
 function assembleStage3Input(
   summaries: ChunkSummary[],
   correlations: CorrelatedEntity[],
+  narratives: Narrative[],
   yesterdayTldr: string | null
 ): string {
   // Rank summaries if > 50
@@ -425,6 +704,12 @@ function assembleStage3Input(
       sourceCount: c.sourceCount,
       avgSentiment: c.avgSentiment
     })),
+    narratives: narratives.map(n => ({
+      name: n.name,
+      memberCount: n.memberCount,
+      avgSentiment: n.avgSentiment,
+      signalStrength: n.signalStrength
+    })),
     yesterdayTldr: yesterdayTldr || "No previous report available."
   });
 }
@@ -437,6 +722,7 @@ function assembleStage3Input(
 const ChunkSummaryLLMSchema = z.object({
   summary: z.string(),                    // prose summary (see Future Pipeline Enhancements for structured-only alternative)
   urgency: z.enum(['routine', 'elevated', 'breaking']),
+  confidence: z.number().min(1).max(10),  // self-reported confidence for routing (Decision 10)
   entities: z.array(z.object({
     name: z.string(),
     aliases: z.array(z.string()).default([]),
@@ -508,16 +794,20 @@ Keep tldr to 2 sentences. Sections: 1 max.
 
 Flash reports are high-risk for false positives. Safeguards:
 
-1. **Corroboration requirement**: `urgency: 'breaking'` must appear in 2+ chunks from 2+ distinct sources OR 3+ chunks from the same source within 30 minutes. Single-chunk breaking triggers are logged but NOT delivered.
+1. **Corroboration requirement (Decision 02)**: `urgency: 'breaking'` chunks within 30 minutes are scored by their source's `trust_weight`. The weighted trust sum must reach >= 1.5 to fire. A single high-trust source (1.0) plus one default source (0.5) can fire; three default sources (0.5 each) also fire. Chunks below threshold are logged but NOT delivered.
 2. **Cooldown**: minimum 30 minutes between flash reports. Second breaking within cooldown is queued.
 3. **Single-source flash**: if only one source reports breaking, the flash report TL;DR is prefixed with "[UNCONFIRMED]".
 
 ```typescript
-function shouldTriggerFlash(breakingChunks: ChunkSummary[]): boolean {
-  const distinctSources = new Set(breakingChunks.map(c => c.source)).size;
-  if (distinctSources >= 2) return true;
-  if (breakingChunks.length >= 3) return true; // same source, 3+ chunks
-  return false; // single chunk = log only
+function shouldTriggerFlash(
+  breakingChunks: ChunkSummary[],
+  sources: Source[]
+): boolean {
+  const weightedSum = breakingChunks.reduce((sum, c) => {
+    const src = sources.find(s => s.id === c.sourceId);
+    return sum + (src?.trustWeight ?? 0.5);
+  }, 0);
+  return weightedSum >= 1.5;
 }
 ```
 
@@ -662,6 +952,7 @@ New on Radar
 | Stage 1 micro-batch (Twitter/RSS/News) | Per-source `poll_interval` | Scheduler checks which sources are due based on `poll_interval` and `last_fetched_at`, then processes their `ready` items concurrently |
 | Stage 1 Poisson claim (Discord) | Adaptive, checked every 60s | Discord uses Poisson-based claim gate instead of fixed `poll_interval`. Compares accumulated `ready` items against expected rate (lambda) from `source_rate_history`. Triggers at 1.5x expected or >10 items. Flags potential breaking at 3x expected or Poisson P < 0.01. See [SCHEDULER.md](./docs/SCHEDULER.md) for thresholds and Poisson function. |
 | Stage 2 correlate | After each Stage 1 | Run correlation query |
+| Narrative clustering | Before Stage 3 daily | Cluster summary embeddings, name clusters, classify signals |
 | Stage 3 daily | Configurable (default 09:00 in configured timezone) | Midnight-to-midnight synthesis |
 | Stage 3 flash | Event-triggered | On `urgency: 'breaking'` from Stage 1 |
 | Market pulse | Every 3h (configurable via `pulse_interval`) | Sonnet synthesis of recent summaries, output scales with activity |
@@ -676,7 +967,7 @@ Log every LLM call to `llm_usage`:
 ```sql
 CREATE TABLE llm_usage (
   id TEXT PRIMARY KEY,
-  stage TEXT NOT NULL,          -- summarize | synthesize | pre-summarize | urgency-classify | pulse
+  stage TEXT NOT NULL,          -- summarize | synthesize | pre-summarize | urgency-classify | pulse | chat | translate | escalate | narrative-cluster | entity-disambiguate
   model TEXT NOT NULL,
   input_tokens INTEGER NOT NULL,
   output_tokens INTEGER NOT NULL,
@@ -686,6 +977,27 @@ CREATE TABLE llm_usage (
 ```
 
 Cost calculation uses published per-token pricing. Daily total available via `/api/v1/status`.
+
+### Prompt Caching Verification
+
+Verify that Pi AI passes through Anthropic's prompt caching headers. Our Stage 1 system prompt is identical across ~50 daily calls -- caching should save ~90% on input tokens automatically.
+
+```typescript
+// 1. Make two identical Stage 1 calls
+// 2. Check Pi AI response for caching indicators
+const response1 = await llm.call({ system: STAGE1_PROMPT, prompt: chunk1 });
+const response2 = await llm.call({ system: STAGE1_PROMPT, prompt: chunk2 });
+
+// 3. Compare usage.input costs
+console.log('Call 1 input cost:', response1.usage.cost);
+console.log('Call 2 input cost:', response2.usage.cost);
+// If call 2 is ~90% cheaper on input, caching is working
+```
+
+If Pi AI doesn't support caching passthrough:
+- **Option A**: Add cache-control headers manually if the provider supports it
+- **Option B**: Accept the cost -- system prompt is ~2000 tokens x $0.25/M = $0.0005 per call. 50 calls/day = $0.025/day. Caching saves ~$0.022/day. Nice to have, not critical.
+- **Option C**: File issue on Pi AI repo requesting cache passthrough
 
 ## Future Pipeline Enhancements
 

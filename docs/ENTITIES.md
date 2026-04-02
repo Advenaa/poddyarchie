@@ -14,11 +14,17 @@ for each extracted entity (name, aliases, type):
     entity_id = SELECT entity_id FROM entity_aliases WHERE alias = canonical
 
     if entity_id is NULL:
-        entity_id = new ULID
-        INSERT ... ON CONFLICT DO NOTHING INTO entities (id, name, type, relevance, first_seen, last_seen)
-            VALUES (entity_id, name, type, 0, now, now)
-        -- If IGNORE fired (concurrent batch wrote same name+type), fetch the winner:
-        entity_id = SELECT id FROM entities WHERE name = name AND type = type
+        -- Check if an archived entity exists with this name+type
+        entity_id = SELECT id FROM entities WHERE name = name AND type = type AND status = 'archived'
+        if entity_id is NOT NULL:
+            -- Reactivate archived entity with history intact
+            UPDATE entities SET status = 'active', relevance = 0.5 WHERE id = entity_id
+        else:
+            entity_id = new ULID
+            INSERT ... ON CONFLICT DO NOTHING INTO entities (id, name, type, relevance, status, first_seen, last_seen)
+                VALUES (entity_id, name, type, 0, 'active', now, now)
+            -- If IGNORE fired (concurrent batch wrote same name+type), fetch the winner:
+            entity_id = SELECT id FROM entities WHERE name = name AND type = type AND status = 'active'
         INSERT ... ON CONFLICT DO NOTHING INTO entity_aliases (alias, entity_id) VALUES (canonical, entity_id)
 
     for each alias in aliases:
@@ -134,37 +140,58 @@ News is weighted highest because news mentions are rarest and highest signal. Di
 Runs at **00:10 UTC** (referenced in DEPLOYMENT.md), after the daily report cron completes.
 
 ```sql
-UPDATE entities SET relevance = relevance * 0.95 WHERE relevance > 0.01;
+UPDATE entities SET relevance = relevance * 0.95
+WHERE status = 'active' AND relevance > 0.01;
 ```
 
-The `WHERE relevance > 0.01` guard skips entities already below the prune threshold, avoiding unnecessary writes and keeping near-zero values from decaying to infinitesimally small numbers. Applied daily. Mention-driven boosts happen in real time during Stage 1 processing.
+The `WHERE status = 'active'` filter ensures only active entities are decayed. The `relevance > 0.01` guard skips entities already below the archive threshold, avoiding unnecessary writes and keeping near-zero values from decaying to infinitesimally small numbers. Applied daily. Mention-driven boosts happen in real time during Stage 1 processing.
 
-## Pruning
+## Archival and Reactivation
 
-### Retention Rule
+Entities are never hard-deleted. Instead, they demote to `status = 'archived'` and can be promoted back to `'active'` when re-mentioned with full history intact.
 
-An entity is pruned when **both** conditions are true:
+### Archival Rule
+
+An entity is archived when **both** conditions are true:
 
 - `relevance < 0.01`
 - `last_seen < now - 90 days`
 
 ```sql
-DELETE FROM entities WHERE relevance < 0.01 AND last_seen_at < NOW() - INTERVAL '90 days';
+UPDATE entities SET status = 'archived'
+WHERE relevance < 0.01 AND last_seen < NOW() - INTERVAL '90 days' AND status = 'active';
 ```
 
-The dual condition prevents pruning a low-relevance entity that was just re-discovered (new `last_seen`) or a stale entity that still has residual relevance from high historical activity.
+The dual condition prevents archiving a low-relevance entity that was just re-discovered (new `last_seen`) or a stale entity that still has residual relevance from high historical activity.
 
-### Cascade
+### What's Preserved When Archived
 
-Pruning an entity deletes its dependents:
+- Entity name, type, all alias mappings in `entity_aliases`
+- Last known relevance (before it decayed to threshold)
+- Last seen timestamp, first seen timestamp
+- All `entity_mentions` rows (subject to normal mention retention cron)
 
-1. Delete from `entity_aliases` where `entity_id` matches.
-2. Delete from `entity_mentions` where `entity_id` matches.
-3. Delete the `entities` row.
+Archived entities do **not** appear in correlations or reports (`WHERE status = 'active'`). They **do** appear in chat/search results (no status filter).
 
-Run inside a single transaction. The mention retention cron (delete mentions older than 90 days) runs independently and handles most mention cleanup before entity pruning fires.
+### Reactivation
 
-## Cross-Source Disambiguation
+When an archived entity is re-mentioned (detected during the alias lookup-then-insert flow in Stage 1):
+
+```sql
+UPDATE entities SET status = 'active', relevance = 0.5 WHERE id = $1 AND status = 'archived';
+```
+
+The entity restarts at `relevance = 0.5` (mid-level, not zero) so it immediately contributes to correlations. All historical aliases and mentions are still linked -- no context is lost.
+
+### Why Not Delete?
+
+Hard-deleting entities loses all context. If CZ disappears for 90 days and is then re-mentioned, the system would treat him as brand new -- no aliases, no mention history, no sentiment baseline. Archival preserves history for entities that return to relevance.
+
+## Three-Tier Disambiguation
+
+Entity disambiguation uses three tiers, each progressively more expensive. Most entities resolve at Tier 1 (free). Ambiguous names escalate through tiers automatically.
+
+### Tier 1: Rule-Based Alias Lookup (free)
 
 The same entity appears differently across sources:
 
@@ -178,13 +205,59 @@ All three resolve to the same canonical entity because the alias table maps `eth
 
 For non-seeded entities, the LLM's `aliases` array in Stage 1 output builds the mapping. When Haiku processes a Discord chunk and returns `{ name: "Uniswap", aliases: ["UNI", "$UNI"] }`, it inserts `uniswap`, `uni` as aliases. A later Twitter chunk referencing `$UNI` strips the `$`, finds `uni` in the alias table, and resolves to the same entity.
 
+Handles ~95% of entities instantly.
+
+### Tier 2: Context-Based Disambiguation (free)
+
+When an alias maps to multiple candidates, check co-occurring entities from the same chunk as free context signal:
+
+```typescript
+if (alias.candidates.length > 1) {
+  const coEntities = context; // other entity names from same chunk
+  for (const candidate of alias.candidates) {
+    const candidateAliases = await getEntityAliases(candidate.id);
+    const contextOverlap = coEntities.filter(e =>
+      candidateAliases.some(a => a.relatedEntities?.includes(e))
+    );
+    if (contextOverlap.length >= 2) {
+      return candidate; // context strongly suggests this candidate
+    }
+  }
+}
+```
+
+Example: "Wormhole" + co-occurring "bridge" + "exploit" = DeFi protocol Wormhole, not the game. DeepEL (Nov 2025) showed co-occurring entities resolve ambiguity for free.
+
+### Tier 3: Batched LLM Disambiguation (~$0.01/day)
+
+Entities still ambiguous after Tier 2 are collected across the entire processing cycle and resolved in a single batched Haiku call:
+
+```typescript
+const prompt = ambiguousEntities.map((e, i) =>
+  `${i+1}. "${e.name}" in context: "${e.surroundingText.slice(0, 200)}"
+  Candidates: ${e.candidates.map(c => `${c.name} (${c.type})`).join(', ')}`
+).join('\n\n');
+
+const response = await llm.call({
+  model: config.models.haiku,
+  system: 'For each ambiguous entity mention, select the correct candidate based on context. Output JSON array: [{"index": 1, "selected": "candidate name"}]',
+  prompt,
+  maxTokens: ambiguousEntities.length * 50,
+  stage: 'entity-disambiguate'
+});
+```
+
+Each disambiguation result is saved as a context-aware alias (`entity_aliases` with `context_key`), so future lookups with the same alias in the same context resolve at Tier 1. The system is self-improving: Day 1 may see 5-10 LLM calls, but by Month 2 most ambiguities resolve via cached context aliases.
+
 ### Edge Cases
 
-- **Name collision across types**: "Mercury" as a token and "Mercury" as a company are separate entities with separate alias sets. The alias `mercury` can only point to one. First writer wins. If the company is seeded first, Discord messages about the Mercury token saying just "Mercury" will misresolve. Mitigation: the LLM usually provides disambiguating aliases (`$MERC` for the token) that create distinct alias paths. When misresolution is detected, use the merge procedure or manually reassign the alias.
+- **Name collision across types**: "Mercury" as a token and "Mercury" as a company are separate entities with separate alias sets. The alias `mercury` can only point to one. First writer wins. If the company is seeded first, Discord messages about the Mercury token saying just "Mercury" will misresolve. Mitigation: context-aware aliases (Tier 2/3) can map "mercury" + DeFi context to the token and "mercury" + company context to the company. When misresolution is detected, use the merge procedure or manually reassign the alias.
 
-- **Ticker collision**: Multiple tokens share `sol`, `uni`, etc. CoinGecko seeding inserts the first match. Later tokens with the same symbol are skipped (`INSERT ... ON CONFLICT DO NOTHING`). Acceptable for MVP -- the dominant token for a given ticker is usually the one that matters.
+- **Ticker collision**: Multiple tokens share `sol`, `uni`, etc. CoinGecko seeding inserts the first match. Later tokens with the same symbol are skipped (`INSERT ... ON CONFLICT DO NOTHING`). Context-aware aliases from Tier 3 can differentiate when co-occurring entities provide enough signal.
 
 - **Alias hijacking**: A new entity could claim an alias that belongs to an existing entity. `INSERT ... ON CONFLICT DO NOTHING` prevents this -- existing aliases are never overwritten. To reassign an alias, delete it first, then re-insert.
+
+- **Self-improvement decay**: Context aliases accumulate over time. No cleanup needed -- alias lookups are indexed and the table stays small relative to items/mentions.
 
 ## Merge Procedure
 

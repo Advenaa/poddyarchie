@@ -5,11 +5,11 @@ Every SQL query the system needs, organized by module. All live in `src/db/queri
 ## 1. Items
 
 ```typescript
-function insertItem(item: RawItem, contentHash: string, status: string): void
+function insertItem(item: RawItem, contentHash: string, status: string, originalLanguage?: string, translated?: boolean): void
 ```
 ```sql
-INSERT INTO items (id, source, source_id, author, content, timestamp, url, engagement, content_hash, status, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+INSERT INTO items (id, source, source_id, author, content, timestamp, url, engagement, content_hash, status, original_language, translated, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
 ```
 
 ```typescript
@@ -43,6 +43,17 @@ function getItemsByBatch(batchId: string): Item[]
 ```sql
 SELECT * FROM items WHERE batch_id = $1 ORDER BY timestamp ASC
 ```
+
+```typescript
+function getFilteredByInjection(limit: number, offset: number): Item[]
+```
+```sql
+SELECT * FROM items
+WHERE status = 'filtered' AND filter_reason = 'injection_detected'
+ORDER BY created_at DESC
+LIMIT $1 OFFSET $2
+```
+Dashboard review of items flagged by InstructDetector (Layer 2 prompt injection defense). Items are preserved for manual false-positive review.
 
 ## 2. Summaries
 
@@ -115,11 +126,11 @@ LIMIT $2 OFFSET $3
 ## 4. Sources
 
 ```typescript
-function insertSource(source: string, sourceId: string, label: string | null): void
+function insertSource(source: string, sourceId: string, label: string | null, trustWeight?: number): void
 ```
 ```sql
-INSERT INTO sources (source, source_id, label, enabled, priority, added_at)
-VALUES ($1, $2, $3, true, 1, $4)
+INSERT INTO sources (source, source_id, label, enabled, priority, trust_weight, added_at)
+VALUES ($1, $2, $3, true, 1, $4, $5)
 ```
 
 ```typescript
@@ -149,6 +160,22 @@ FROM sources s
 LEFT JOIN source_state ss ON s.source = ss.source AND s.source_id = ss.source_id
 ORDER BY s.source, s.label
 ```
+
+```typescript
+function getSourceTrustWeight(source: string, sourceId: string): { trust_weight: number } | null
+```
+```sql
+SELECT trust_weight FROM sources WHERE source = $1 AND source_id = $2
+```
+
+```typescript
+function adjustSourceTrustWeight(source: string, sourceId: string, delta: number, floor: number, ceiling: number): void
+```
+```sql
+UPDATE sources SET trust_weight = GREATEST($3, LEAST($4, trust_weight + $5))
+WHERE source = $1 AND source_id = $2
+```
+Auto-adjustment after flash alert confirmation. `delta` is +0.05 (confirmed) or -0.03 (unconfirmed). `floor` and `ceiling` are ±0.2 from the initial manual weight.
 
 ## 5. Source State
 
@@ -204,6 +231,31 @@ SELECT entity_id FROM entity_aliases WHERE alias = $1
 ```
 
 ```typescript
+function lookupAliasWithContext(alias: string, contextKey: string): string | null
+```
+```sql
+SELECT entity_id FROM entity_aliases WHERE alias = $1 AND context_key = $2
+```
+Context-aware alias lookup. `contextKey` encodes the domain context (e.g., `'defi'`, `'gaming'`). Falls back to `lookupAlias` (no context) if no context-specific match exists.
+
+```typescript
+function insertContextAlias(alias: string, entityId: string, contextKey: string): void
+```
+```sql
+INSERT INTO entity_aliases (alias, entity_id, context_key) VALUES ($1, $2, $3)
+ON CONFLICT DO NOTHING
+```
+Saves a disambiguation result as a context-aware alias. Future lookups with the same alias+context resolve without an LLM call.
+
+```typescript
+function getEntityAliases(entityId: string): { alias: string; context_key: string | null }[]
+```
+```sql
+SELECT alias, context_key FROM entity_aliases WHERE entity_id = $1
+```
+Returns all aliases (with optional context keys) for an entity. Used during context-based disambiguation (Step 2) to check for co-occurring entity overlap.
+
+```typescript
 function insertEntity(id: string, name: string, type: string, now: number): void
 ```
 ```sql
@@ -213,12 +265,13 @@ ON CONFLICT DO NOTHING
 ```
 
 ```typescript
-function getEntityByNameType(name: string, type: string): string | null
+function getEntityByNameType(name: string, type: string, status?: string): string | null
 ```
 ```sql
 SELECT id FROM entities WHERE name = $1 AND type = $2
+  AND ($3::text IS NULL OR status = $3)
 ```
-Fallback after `INSERT ... ON CONFLICT DO NOTHING` fires (concurrent batch wrote same name+type).
+Fallback after `INSERT ... ON CONFLICT DO NOTHING` fires (concurrent batch wrote same name+type). Optional `status` param filters by `'active'` or `'archived'`.
 
 ```typescript
 function insertAlias(alias: string, entityId: string): void
@@ -252,21 +305,27 @@ function decayAllEntities(): void
 ```
 ```sql
 UPDATE entities SET relevance = relevance * 0.95
+WHERE status = 'active' AND relevance > 0.01
 ```
+Only decays active entities. The `relevance > 0.01` guard skips entities already below the archive threshold.
 
 ```typescript
-function pruneDeadEntities(threshold: number, cutoff: number): number
+function archiveDeadEntities(threshold: number, cutoff: number): number
 ```
 ```sql
-DELETE FROM entity_aliases WHERE entity_id IN (
-  SELECT id FROM entities WHERE relevance < $1 AND last_seen < $2
-);
-DELETE FROM entity_mentions WHERE entity_id IN (
-  SELECT id FROM entities WHERE relevance < $1 AND last_seen < $2
-);
-DELETE FROM entities WHERE relevance < $1 AND last_seen < $2
+UPDATE entities SET status = 'archived'
+WHERE relevance < $1 AND last_seen < $2 AND status = 'active'
 ```
-Run in a single transaction. `threshold` = 0.01, `cutoff` = now - 90 days.
+Archives instead of deleting. `threshold` = 0.01, `cutoff` = now - 90 days. Aliases and mentions are preserved for reactivation.
+
+```typescript
+function reactivateEntity(entityId: string, relevance: number): void
+```
+```sql
+UPDATE entities SET status = 'active', relevance = $2
+WHERE id = $1 AND status = 'archived'
+```
+Promotes an archived entity back to active with a restart relevance (typically 0.5). Called when a previously archived entity is re-mentioned.
 
 ## 7. Correlation
 
@@ -280,13 +339,38 @@ SELECT e.name, e.type,
        string_agg(DISTINCT em.source, ',') AS sources
 FROM entity_mentions em
 JOIN entities e ON e.id = em.entity_id
-WHERE em.created_at > $1
+WHERE em.created_at > $1 AND e.status = 'active'
 GROUP BY e.id, e.name, e.type
 HAVING COUNT(DISTINCT em.source) >= 2
 ORDER BY source_count DESC, ABS(avg_sentiment) DESC
 LIMIT 20
 ```
 `windowStart` = now - 24h. Cross-source signal: entities in 2+ sources.
+
+## 7.5. Narratives
+
+```typescript
+function insertNarrative(id: string, name: string, date: string, memberCount: number, avgSentiment: number | null, signalStrength: string, summaryIds: string[], now: number): void
+```
+```sql
+INSERT INTO narratives (id, name, date, member_count, avg_sentiment, signal_strength, summary_ids, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+```
+
+```typescript
+function getNarrativesByDate(date: string): Narrative[]
+```
+```sql
+SELECT * FROM narratives WHERE date = $1 ORDER BY member_count DESC
+```
+
+```typescript
+function getPreviousDayNarratives(date: string): Narrative[]
+```
+```sql
+SELECT * FROM narratives WHERE date = ($1::date - INTERVAL '1 day')::date ORDER BY member_count DESC
+```
+Used for signal strength classification (growth comparison vs previous day).
 
 ## 8. App Config
 
@@ -323,6 +407,7 @@ function insertLLMUsage(id: string, stage: string, model: string, inputTokens: n
 INSERT INTO llm_usage (id, stage, model, input_tokens, output_tokens, cost_usd, created_at)
 VALUES ($1, $2, $3, $4, $5, $6, $7)
 ```
+`stage` is one of: `'summarize'`, `'synthesize'`, `'pre-summarize'`, `'urgency-classify'`, `'pulse'`, `'chat'`, `'translate'`, `'escalate'`, `'narrative-cluster'`, `'entity-disambiguate'`.
 
 ```typescript
 function getDailyCost(dayStart: number, dayEnd: number): { totalCost: number; byStage: { stage: string; cost: number }[] }
@@ -400,6 +485,33 @@ function deleteEmbeddingsByRef(targetType: string, targetId: string): void
 DELETE FROM embeddings WHERE target_type = $1 AND target_id = $2
 ```
 Cascading delete. Called when the referenced record (item, summary, entity, report) is deleted.
+
+## 11.5. RAG Chat Retrieval Tools
+
+Queries backing the three retrieval tools available to Sonnet during chat (Decision 07).
+
+**keyword_search** — entity mention lookup:
+```typescript
+function getEntityMentions(entityName: string, windowStart: number, windowEnd: number): EntityMention[]
+```
+```sql
+SELECT em.*, e.name, e.type
+FROM entity_mentions em
+JOIN entities e ON e.id = em.entity_id
+JOIN entity_aliases ea ON ea.entity_id = e.id
+WHERE ea.alias = $1 AND em.created_at BETWEEN $2 AND $3
+ORDER BY em.created_at DESC
+```
+`entityName` is lowercased before lookup. Returns mention counts, sentiment, and source breakdown for the matched entity.
+
+**read_raw** — read original source message:
+```typescript
+function getItemById(itemId: string): Item | null
+```
+```sql
+SELECT * FROM items WHERE id = $1
+```
+Used by the `read_raw` tool to retrieve the original unprocessed message for verification or quoting.
 
 ## 12. Retention
 

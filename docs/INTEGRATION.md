@@ -3,15 +3,17 @@
 ## The Full Journey of a Message
 
 ```
-Discord msg → Ingest → Normalize → Wait → Batch Claim → Chunk → Haiku → Summary + Entities
+Discord msg → Ingest → Normalize* → Wait → Batch Claim → Chunk → Haiku → Summary + Entities
                                                                               ↓
-Twitter tweet → Ingest → Normalize → Wait → ─── same ───────────────────── Correlate (SQL)
-                                      ↓                                       ↓
-RSS entry → Ingest → Normalize → Pre-summarize → Wait → ─── same ──── Synthesize (Sonnet)
-                                      ↓                                       ↓
-News article → Ingest → Normalize → Pre-summarize → Wait → ─── same ── Report → Webhook
+Twitter tweet → Ingest → Normalize* → Wait → ─── same ───────────────────── Correlate (SQL)
+                                       ↓                                      ↓
+RSS entry → Ingest → Normalize* → Pre-summarize → Wait → ─── same ──── Synthesize (Sonnet)
+                                       ↓                                      ↓
+News article → Ingest → Normalize* → Pre-summarize → Wait → ─── same ── Report → Webhook
 
-                                                              Every 3h ── Pulse (Sonnet) → Webhook
+                                                               Every 3h ── Pulse (Sonnet) → Webhook
+
+*Normalize includes: truncate → InstructDetector scan → dedup → spam → lang detect → Ind→EN translate (Haiku)
 ```
 
 ## Step by Step
@@ -48,7 +50,7 @@ function onMessageCreate(event: GatewayEvent) {
 
 ### 2. Normalize decides if it survives
 
-Normalize is pure rule-based — no LLM calls.
+Normalize is mostly rule-based. The only LLM call is Indonesian→English translation (Haiku).
 
 ```typescript
 function normalize(item: RawItem) {
@@ -57,7 +59,18 @@ function normalize(item: RawItem) {
     item.content = item.content.slice(0, 20000);
   }
   
-  // Content hash for dedup
+  // Layer 1: Unicode normalization + zero-width strip (Decision 06)
+  item.content = item.content.normalize('NFC');
+  item.content = item.content.replace(/[\u200B-\u200F\u2028-\u202F\uFEFF]/g, '');
+  
+  // Layer 2: InstructDetector scan — prompt injection defense (Decision 06)
+  const hasInjection = await instructDetector.scan(item.content);
+  if (hasInjection) {
+    insertItem(item, '', 'filtered', 'injection_detected');
+    return;
+  }
+  
+  // Content hash for dedup (after sanitization, so hashes are stable)
   const hash = sha256(item.source + item.sourceId + item.content.slice(0, 200));
   
   // Check for duplicate
@@ -85,7 +98,22 @@ function normalize(item: RawItem) {
     return;
   }
   
-  // Passed all checks — saved with full original content
+  // Indonesian → English translation (Decision 01)
+  // Translate before saving so all downstream processing works with English text.
+  // 14-17pp accuracy loss avoided by translating before Stage 1 (XBridge architecture).
+  if (lang === 'ind') {
+    const translated = await llm.call({
+      model: config.models.haiku,
+      system: 'Translate the following Indonesian text to English. Preserve all entity names, numbers, and technical terms. Output only the translation.',
+      prompt: item.content,
+      maxTokens: Math.ceil(item.content.length / 4) * 1.5
+    });
+    item.content = translated.text;
+    item.metadata.originalLanguage = 'ind';
+    item.metadata.translated = true;
+  }
+  
+  // Passed all checks — saved with full original content (translated if Indonesian)
   insertItem(item, hash, 'ready');
 }
 ```
@@ -180,24 +208,75 @@ async function processSingleSource(source: string, sourceId: string) {
   // Step 3: Chunk by token budget
   const chunks = chunkByTokens(items, 6000);
   
-  // Step 4: Process each chunk through Haiku
+  // Step 4: Process each chunk through Haiku (with confidence escalation)
+  const ambiguousEntities: AmbiguousEntity[] = []; // collect for batched disambiguation
+  
   for (const chunk of chunks) {
-    const summary = await summarizeChunk(source, sourceId, chunk, windowStart, windowEnd);
+    let summary = await summarizeChunk(source, sourceId, chunk, windowStart, windowEnd);
+    
+    // Confidence-based escalation to Sonnet (Decision 10)
+    // Low confidence + non-routine = Haiku is unsure about something important → escalate
+    if (summary && summary.confidence < 5 && summary.urgency !== 'routine') {
+      logger.info({ chunkId: chunk.id, confidence: summary.confidence, urgency: summary.urgency },
+        'Escalating chunk to Sonnet');
+      summary = await summarizeChunk(source, sourceId, chunk, windowStart, windowEnd, 'sonnet');
+    }
     
     if (summary) {
       // Write summary to DB
       saveSummary(summary);
       
-      // Extract and resolve entities
-      // Entity resolution — uncomment when entity tables are built (step 19 in build order)
-      // for (const entity of summary.entities) {
-      //   resolveAndUpsertEntity(entity, source, summary.id);
-      // }
-      
-      // Check for flash trigger
-      if (summary.urgency === 'breaking') {
-        await synthesize.runFlash();
+      // Three-tier entity disambiguation (Decision 09)
+      // Tier 1: alias lookup (instant, handles ~95% of entities)
+      // Tier 2: co-occurring entity context check (free, resolves ambiguous names)
+      // Tier 3: batched Haiku call (deferred, for remaining ambiguity)
+      for (const entity of summary.entities) {
+        const resolved = await resolveEntity(entity.name, summary.entities.map(e => e.name));
+        if (resolved) {
+          upsertEntityMention(resolved.id, source, summary.id, entity);
+        } else if (entity.candidates?.length > 1) {
+          // Ambiguous — defer to batched LLM disambiguation
+          ambiguousEntities.push({
+            name: entity.name,
+            surroundingText: chunk.rawText,
+            candidates: entity.candidates,
+          });
+        }
       }
+      
+      // Check for flash trigger — weighted trust sum (Decision 02)
+      // Old: fire if 2+ distinct sources report breaking
+      // New: sum trust weights of sources reporting breaking, fire if >= 1.5
+      if (summary.urgency === 'breaking') {
+        const breakingChunks = await getRecentBreakingChunks('30 minutes');
+        const weightedSum = breakingChunks.reduce((sum, c) => {
+          const src = sources.find(s => s.id === c.sourceId);
+          return sum + (src?.trustWeight ?? 0.5);
+        }, 0);
+        if (weightedSum >= 1.5) {
+          await synthesize.runFlash();
+        }
+      }
+    }
+  }
+  
+  // Tier 3: Batched LLM disambiguation for remaining ambiguous entities (Decision 09)
+  if (ambiguousEntities.length > 0) {
+    const prompt = ambiguousEntities.map((e, i) =>
+      `${i+1}. "${e.name}" in context: "${e.surroundingText.slice(0, 200)}"
+      Candidates: ${e.candidates.map(c => `${c.name} (${c.type})`).join(', ')}`
+    ).join('\n\n');
+    
+    const response = await llm.call({
+      model: config.models.haiku,
+      system: 'For each ambiguous entity, select the correct candidate. Output JSON: [{"index": 1, "selected": "name"}]',
+      prompt,
+      maxTokens: ambiguousEntities.length * 50,
+    });
+    // Save results as new aliases — self-improving, reduces future LLM calls
+    for (const resolution of JSON.parse(response.text)) {
+      const entity = ambiguousEntities[resolution.index - 1];
+      await insertAlias(entity.name, entity.contextKey, resolution.selectedId);
     }
   }
   
@@ -225,8 +304,17 @@ async function summarizeChunk(
     `[${item.author} at ${new Date(item.timestamp).toISOString()}]\n${item.content}`
   ).join('\n---\n');
   
+  // Budget hints — complexity-adaptive output control (Decision 03)
+  // Sparse chunks get a conciseness hint; dense chunks write freely.
+  const isDense = items.length > 15
+    || estimateTokens(formattedContent) > 4000
+    || items.some(i => /breaking|exploit|hack|emergency/i.test(i.content));
+  const budgetHint = isDense
+    ? '' // no constraint — let Haiku write freely
+    : '\nTarget ~400 tokens for the summary field. Be concise.';
+  
   // Build the prompt (see PIPELINE.md for full system prompt)
-  const systemPrompt = buildStage1Prompt(source, sourceId, windowStart, windowEnd);
+  const systemPrompt = buildStage1Prompt(source, sourceId, windowStart, windowEnd) + budgetHint;
   const userMessage = `<scraped_content>\n${formattedContent}\n</scraped_content>`;
   
   // Call LLM through the wrapper (handles retries, errors, cost logging)
@@ -242,14 +330,20 @@ async function summarizeChunk(
   const parsed = ChunkSummarySchema.safeParse(JSON.parse(response.content));
   
   if (!parsed.success) {
-    // Retry once with correction prompt
+    // Retry with zod error-path feedback (Decision 08)
+    // Feed specific error paths back so Haiku knows exactly what to fix.
+    // PARSE (EMNLP 2025): 92% error reduction vs generic "try again" retry.
+    const errorMessages = parsed.error.issues.map(issue =>
+      `- ${issue.path.join('.')}: ${issue.message} (received: ${JSON.stringify((issue as any).received)})`
+    ).join('\n');
+    
     const retryResponse = await llm.call({
-      model: config.models.haiku,  // from config.ts, default 'claude-haiku-4-5-20251001'
+      model: config.models.haiku,
       system: systemPrompt,
       messages: [
         { role: 'user', content: userMessage },
         { role: 'assistant', content: response.content },
-        { role: 'user', content: 'Your response was not valid JSON. Return ONLY the JSON object.' }
+        { role: 'user', content: `Your previous output had these validation errors:\n${errorMessages}\n\nFix ONLY these fields. Keep everything else the same.` }
       ],
       maxTokens: 3000,
       stage: 'summarize'
@@ -334,13 +428,18 @@ async function runDaily() {
   // Ensures news/RSS voice is always represented even when Discord dominates engagement
   const exemplars = selectExemplars(ranked, { engagement: 7, rssNews: 3 });
   
+  // Narrative clustering — detect emerging themes from summary embeddings (Decision 05)
+  // Clusters existing embeddings via k-means, names each cluster with one Haiku call.
+  // Provides the WHY layer: entities = WHAT, sentiment = HOW, narratives = WHY.
+  const narratives = await detectNarratives(ranked);
+  
   // Build input and call Sonnet
   // Stage 3 prompt includes explicit causal instruction:
   //   "State causal connections explicitly. If A caused B, say so.
   //    If correlation is unconfirmed, qualify with 'likely' or 'appears to'."
   // Daily synthesis includes raw Stage 1 correlated entity data alongside the 8 pulses,
   // so Sonnet can cross-check pulse narrative against actual data.
-  const input = assembleStage3Input(ranked, correlations, yesterday?.tldr);
+  const input = assembleStage3Input(ranked, correlations, yesterday?.tldr, narratives);
   const report = await callSonnet(input);  // see PIPELINE.md for prompt
   
   // Check for duplicate daily
@@ -529,9 +628,75 @@ Each chunk gets its own Haiku call. The summaries are independent — they overl
 
 ## Indonesian Content Handling
 
-Indonesian-language messages pass normalization (`franc` detects `ind`). In the Haiku prompt:
+Indonesian-language messages are detected by `franc` in normalize and translated to English via a Haiku call before being saved as `ready` (Decision 01). This means all downstream processing (Stage 1, correlation, synthesis, embeddings) works with English text.
 
-- Input content may be in Bahasa Indonesia
-- Output (summary, keyEvents) is always in English
-- Entity canonical names use English form ("Bank Indonesia" not "BI", "Indonesian rupiah" not "IDR" for the currency entity)
+- Translation happens once at ingest — not repeated at each stage
+- Original language tracked in `item.metadata.originalLanguage` and `item.metadata.translated`
+- Entity canonical names use English form ("Bank Indonesia" not "BI", "Indonesian rupiah" not "IDR")
 - This allows cross-source correlation between Indonesian Discord and English Twitter/news
+- Chat queries in Indonesian are also translated before search (Decision 11, see section 10 below)
+- Cost: ~$0.02-0.04/day for 15-20 extra Haiku calls on Indonesian chunks
+
+### 9. RAG Chat -- how a question becomes an answer
+
+Sonnet receives three retrieval tools and picks the right one per query (Decision 07):
+
+```typescript
+// Tool 1: semantic_search — cosine similarity vs summary/report embeddings
+//   Use for: "What happened with SOL?", topic/theme questions
+//   Backend: Gemini embeddings, in-memory cosine, top 10 > 0.3 threshold
+
+// Tool 2: keyword_search — entity table lookup
+//   Use for: "How is sentiment on ETH?", mention counts, source breakdown
+//   Backend: Postgres entities + entity_mentions tables
+
+// Tool 3: read_raw — fetch original source message by item ID
+//   Use for: "Show me the original message about the exploit"
+//   Backend: items table, returns full content + metadata
+
+async function handleChat(userMessage: string, history: ChatMessage[]): Promise<string> {
+  // Language detection + translation for Indonesian queries (Decision 11)
+  const lang = detectLanguage(userMessage);
+  if (lang === 'ind') {
+    userMessage = await llm.call({
+      model: config.models.haiku,
+      system: 'Translate Indonesian to English. Preserve entity names and technical terms. Output only the translation.',
+      prompt: userMessage,
+      maxTokens: 200
+    }).then(r => r.text);
+  }
+  
+  const response = await llm.call({
+    model: config.models.sonnet,
+    system: CHAT_SYSTEM_PROMPT,
+    messages: [...history, { role: 'user', content: userMessage }],
+    tools: chatTools,  // semantic_search, keyword_search, read_raw
+    maxTokens: 2000
+  });
+  
+  // Handle tool calls iteratively — Sonnet may chain multiple tools
+  while (response.toolCalls?.length) {
+    const results = await executeToolCalls(response.toolCalls);
+    response = await llm.call({
+      model: config.models.sonnet,
+      system: CHAT_SYSTEM_PROMPT,
+      messages: [...history, { role: 'user', content: userMessage }, ...results],
+      tools: chatTools,
+      maxTokens: 2000
+    });
+  }
+  
+  return response.text;
+}
+```
+
+### 10. Chat query translation -- Indonesian queries
+
+Indonesian chat queries are detected and translated to English before search (Decision 11). All summaries and embeddings are in English (after Decision 01 translates Indonesian source content at ingest), so English query vs English embeddings gives the best cosine similarity.
+
+```
+Indonesian query → franc detects 'ind' → Haiku translates to English → search English embeddings
+English query    → franc detects 'eng' → search English embeddings directly (no translation)
+```
+
+Cost: maybe 1-2 Indonesian queries per day, negligible.

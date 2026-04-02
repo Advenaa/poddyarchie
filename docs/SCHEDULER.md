@@ -37,18 +37,20 @@ Cron registration order matches this table top-to-bottom. Event-driven jobs (Sta
 
 | Job | Type | Cron Expression | Calls | Depends On |
 |-----|------|-----------------|-------|------------|
-| Stage 1 micro-batch (Twitter/RSS/News) | per-source | Each source's `poll_interval` (e.g., Twitter 2h, RSS 15min) | `summarize.runBatch()` | Items with `status='ready'` for sources due for processing |
+| Stage 1 micro-batch (Twitter/RSS/News) | per-source | Each source's `poll_interval` (e.g., Twitter 2h, RSS 15min) | `summarize.runBatch()` | Items with `status='ready'` for sources due for processing. Low-confidence non-routine chunks may escalate to Sonnet. |
 | Stage 1 Poisson claim (Discord) | check every 60s | Adaptive: Poisson threshold against `source_rate_history` | `summarize.runBatch()` | Discord `ready` items exceeding expected rate x 1.5 OR > 10 items |
 | Stage 3 daily | cron | `{mm} {hh} * * *` in configured TZ (default `0 9 * * *`) | `synthesize.runDaily()` | Summaries from previous calendar day |
 | Market pulse | cron | `0 */3 * * *` UTC (every 3h) | `pulse.run()` | Summaries from last 3h window. Sonnet. Output scales with activity. |
-| Entity decay | cron | `0 0 * * *` UTC | `decay.run()` | All entities |
+| Entity decay | cron | `0 0 * * *` UTC | `decay.run()` | Active entities only. Archives (not deletes) entities below threshold. |
 | Data retention | cron | `5 0 * * *` UTC (after decay) | `retention.run()` | Runs after decay so pruned entities are already decayed |
 | Backup | cron | `10 0 * * *` UTC (after retention) | `db.backup()` (pg_dump) | Runs after retention so backup is clean |
 | Scraper health | cron | `*/5 * * * *` (every 5min) | `sources.healthCheck()` | `source_state` rows with `status='backoff'` |
 | Health check | cron | `*/5 * * * *` (every 5min) | `health.check()` | 7 checks: source silence, source disabled, LLM failures, missed pulse, missed daily, DB pool, cost spike. Inserts into `health_events`. Critical → `ALERT_WEBHOOK_URL`. Dedup: skip if same category+message unacknowledged within 30min. |
+| Narrative clustering | direct call | Before Stage 3 daily synthesis | `narratives.detect()` | Summary embeddings from previous day |
 | Stage 2 correlate | direct call | After each Stage 1 | `correlate.run()` | Stage 1 completion |
 | Stage 3 flash | direct call | When Stage 1 returns `urgency: 'breaking'` | `synthesize.runFlash()` | Breaking chunk from Stage 1 |
 | Delivery | direct call | After Stage 3 daily | `webhook.deliver(report)` | Stage 3 daily completion |
+| Trust weight adjust | direct call | 1 hour after flash delivery | `trust.adjustWeights(flashId)` | Flash delivery completion |
 
 The midnight UTC cluster (decay at `:00`, retention at `:05`, backup at `:10`) is staggered by 5 minutes to spread load.
 
@@ -145,6 +147,7 @@ scheduler checks due sources (per poll_interval)
        //   ├─ processes all due sources in parallel via Promise.allSettled
        //   ├─ per source: claims items, chunks by token budget (6,000 tokens per chunk)
        //   ├─ calls Haiku per chunk via llm.ts
+       //   ├─ if confidence < 5 AND urgency != 'routine': escalates chunk to Sonnet
        //   ├─ writes summaries + entities + updates items in one tx
        //   └─ returns ChunkResult[] (includes urgency per chunk)
 
@@ -152,11 +155,19 @@ scheduler checks due sources (per poll_interval)
        //   └─ SQL: entities appearing in 2+ sources within same window
 
        if (batches.some(b => b.urgency === 'breaking')) {
-         await synthesize.runFlash()
+         const flashReport = await synthesize.runFlash()
          //   ├─ reads summaries from last 4h
          //   ├─ calls Sonnet via llm.ts
          //   ├─ writes report with type='flash'
          //   └─ await webhook.deliver(report, { prefix: '[FLASH]' })
+
+         if (flashReport) {
+           // Schedule trust weight adjustment 1 hour after flash delivery
+           setTimeout(() => trust.adjustWeights(flashReport.id), 60 * 60 * 1000);
+           //   ├─ checks which sources confirmed within 1 hour
+           //   ├─ confirmed sources: trust_weight += 0.05 (capped at initial + 0.2)
+           //   └─ unconfirmed sources: trust_weight -= 0.03 (floored at initial - 0.2)
+         }
        }
      })
 ```
@@ -184,6 +195,13 @@ cron('0 */3 * * *', { timezone: 'UTC' })
 ```
 cron('{mm} {hh} * * *', { timezone })
   └─ withMutex('stage3-daily', async () => {
+       const narratives = await narratives.detect()
+       //   ├─ loads summary embeddings from previous calendar day
+       //   ├─ runs k-means clustering with silhouette-based k selection
+       //   ├─ names clusters with 3+ members via Haiku (~3-5 calls)
+       //   ├─ classifies signal strength vs previous day (new/emerging/strong/stable/fading)
+       //   └─ writes to narratives table
+
        const report = await synthesize.runDaily()
        //   ├─ reads summaries where window overlaps previous calendar day
        //   ├─ reads correlated entities for same window
@@ -237,8 +255,14 @@ export async function run(): Promise<CorrelatedEntity[]>
 export async function runDaily(): Promise<MarketReport | null>
 export async function runFlash(): Promise<MarketReport | null>
 
+// src/process/narratives.ts
+export async function detect(): Promise<Narrative[]>
+
 // src/process/pulse.ts
 export async function run(): Promise<MarketReport | null>
+
+// src/knowledge/trust.ts
+export async function adjustWeights(flashReportId: string): Promise<void>
 
 // src/health.ts
 export async function check(): Promise<void>

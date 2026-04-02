@@ -30,15 +30,16 @@ Every message gets converted to the same format — author, content, timestamp, 
 
 ### Step 2: Normalize (The Bouncer)
 
-Every message hits five checks. No AI, just rules:
+Every message hits six checks. Mostly rules, one LLM call for Indonesian translation:
 
 1. **Too long?** Over 20K characters gets cut. Only hits RSS/news articles — Discord has a 2K char limit.
 2. **Seen before?** Hash the content, check the database. Duplicate? Drop it.
 3. **Same URL from another source?** Expand shortened links (t.co, bit.ly), check if another source already posted it.
 4. **Spam?** Rule-based. "gm", single emoji, airdrop copypasta. Kills 40-60% of Discord volume.
 5. **Wrong language?** English and Indonesian only. Japanese, Korean, etc. get dropped.
+6. **Indonesian?** Indonesian content is translated to English via Haiku before saving.
 
-Pass all five → saved as `ready`, sits in the database.
+Pass all six → saved as `ready`, sits in the database.
 Fail any → saved as `filtered`, kept for debugging but never processed.
 
 ### Step 3: Pre-Summarize
@@ -84,10 +85,7 @@ Then three safety checks:
 Did any chunk come back with `urgency: "breaking"`?
 
 No → move on.
-Yes → check if it's corroborated:
-- **2+ different sources** said breaking → fire flash report
-- **3+ chunks from same source** said breaking → fire flash report
-- **1 chunk, 1 source** → log it, don't fire. Could be someone overreacting.
+Yes → compute a weighted trust sum across reporting sources. Each source has a trust weight (e.g. news = 1.0, established Discord = 0.5, noisy channel = 0.3). Sum the weights of all sources that reported breaking. If the weighted trust sum >= 1.5 → fire flash report. Below 1.5 → log it, don't fire.
 
 If it fires, Sonnet gets called immediately with just the last 4 hours of summaries. Produces a 2-sentence TL;DR. Delivered to Discord webhook with `[FLASH]` prefix, orange embed. 30-minute cooldown before another flash can fire.
 
@@ -202,8 +200,12 @@ Single process, one port. No Docker, no microservices.
 
 ## Cost
 
-~$0.81-0.96/day (~$25-29/month) for the full system:
-- Stage 1 Haiku calls: ~$0.15/day
+~$0.82-1.06/day (~$25-32/month) for the full system:
+- Stage 1 Haiku calls: ~$0.10/day (budget hints reduce output)
+- Indonesian translation (Haiku): ~$0.02-0.04/day
+- Confidence escalation (Sonnet): ~$0.02-0.05/day
+- Narrative clustering (Haiku): ~$0.01/day
+- Entity disambiguation (Haiku): ~$0.01/day
 - 8 Sonnet pulses: ~$0.11/day
 - Daily synthesis: ~$0.05/day
 - Flash reports: ~$0.05/day

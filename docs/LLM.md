@@ -12,12 +12,14 @@ interface LLMCallParams {
   system: string;                             // system prompt
   messages: { role: 'user' | 'assistant'; content: string }[];
   maxTokens: number;                          // max output tokens
-  stage: 'summarize' | 'synthesize' | 'pre-summarize' | 'urgency-classify' | 'pulse' | 'chat';
+  stage: 'summarize' | 'synthesize' | 'pre-summarize' | 'urgency-classify' | 'pulse' | 'chat' | 'translate' | 'escalate' | 'narrative-cluster' | 'entity-disambiguate';
+  tools?: ToolDefinition[];                       // optional tool definitions (used by chat)
 }
 
 interface LLMCallResult {
   content: string;                            // raw text from the model
   usage: { input_tokens: number; output_tokens: number };
+  toolCalls?: { name: string; arguments: Record<string, unknown> }[];  // populated when model invokes tools
 }
 
 async function call(params: LLMCallParams): Promise<LLMCallResult>
@@ -36,7 +38,11 @@ Model IDs live in `config.ts` as Pi model identifiers. Never hardcode model stri
 | Stage 3 (synthesize) | Sonnet | `claude-sonnet-4-6-20250514` |
 | Urgency classify | Haiku | `claude-haiku-4-5-20251001` |
 | Market pulse | Sonnet | `claude-sonnet-4-6-20250514` |
-| Chat (RAG) | Sonnet | `claude-sonnet-4-6-20250514` |
+| Chat (RAG) | Sonnet | `claude-sonnet-4-6-20250514` | Tool calling enabled (semantic_search, keyword_search, read_raw) |
+| Translation (Indonesian→English) | Haiku | `claude-haiku-4-5-20251001` |
+| Stage 1 escalation (low-confidence) | Sonnet | `claude-sonnet-4-6-20250514` |
+| Narrative cluster naming | Haiku | `claude-haiku-4-5-20251001` |
+| Entity disambiguation (batched) | Haiku | `claude-haiku-4-5-20251001` |
 
 ## Pi AI Provider Configuration
 
@@ -107,8 +113,9 @@ llm.call() receives response
   |     -> retry up to 3x
   |     -> if all 3 fail: log error, surface on /settings
   |
-  +-- Valid HTTP, invalid JSON (L7)
-  |     -> retry once with FRESH prompt (see retry safety below)
+  +-- Valid HTTP, invalid JSON or zod validation failure (L7)
+  |     -> JSON parse failure: retry once with FRESH prompt (see retry safety below)
+  |     -> zod validation failure: retry once with error-path feedback (see zod section below)
   |     -> if retry also fails: skip chunk, log error
   |
   +-- Empty content / refusal (L8)
@@ -180,7 +187,7 @@ VALUES ($1, $2, $3, $4, $5, $6, $7);
 
 Fields:
 - `id` — ULID
-- `stage` — one of `summarize`, `synthesize`, `urgency-classify`, `pulse`, `chat`
+- `stage` — one of `summarize`, `synthesize`, `pre-summarize`, `urgency-classify`, `pulse`, `chat`, `translate`, `escalate`, `narrative-cluster`, `entity-disambiguate`
 - `model` — the actual model ID used
 - `input_tokens` / `output_tokens` — from Pi `response.usage` object
 - `cost_usd` — from Pi `response.usage.cost.total`
@@ -192,14 +199,20 @@ Daily cost total is exposed via `GET /api/v1/status` (`llmCostToday` field).
 
 | Stage | Calls/day | Model | Cost | Breakdown |
 |-------|-----------|-------|------|-----------|
-| Summarize (Stage 1) | ~50 | Haiku | ~$0.15 | 50 × 6K input × $0.25/M + 50 × 1K output × $1.25/M |
+| Summarize (Stage 1) | ~50 | Haiku | ~$0.10 | Budget hints reduce output ~30-40%. Prompt caching saves ~90% on repeated system prompt tokens.* |
 | Pulse | 8 | Sonnet | ~$0.11 | 8 × 2K input × $3/M + 8 × 500 output × $15/M |
 | Synthesize (daily) | 1 | Sonnet | ~$0.05 | |
 | Synthesize (flash) | rare | Sonnet | ~$0.05 | |
 | Chat (RAG) | ~10-20 | Sonnet | ~$0.15-0.30 | Depends on usage |
+| Translation (Indonesian) | ~15-20 | Haiku | ~$0.02-0.04 | Only Indonesian content, gated by language detection |
+| Stage 1 escalation | ~2-3 | Sonnet | ~$0.02-0.05 | Low-confidence + non-routine chunks re-processed by Sonnet |
+| Narrative cluster naming | ~3-5 | Haiku | ~$0.01 | ~200 tokens per cluster name |
+| Entity disambiguation | ~1-2 | Haiku | ~$0.01 | Batched; decreases over time as aliases are cached |
 | Embeddings | ~500-800 | Gemini | $0 | Free tier |
 | twitterapi.io | — | — | ~$0.30 | $9/month |
-| **Total** | | | **~$0.81-0.96/day (~$25-29/month)** | |
+| **Total** | | | **~$0.82-1.06/day (~$25-32/month)** | |
+
+> \* **Prompt caching**: Anthropic automatically caches repeated prompt prefixes. Our Stage 1 system prompt (~2000 tokens) is identical across all ~50 daily calls. After the first call, subsequent calls pay ~90% less for system prompt input tokens. Verify caching is active by comparing `response.usage.cost` between the first and second calls of a session.
 
 > **Gemini free tier**: allows 1,500 requests/day. At 30 Discord channels + Twitter + RSS, expect ~500-800 embedding requests/day. Headroom exists but monitor usage — paid tier is required if exceeded.
 
@@ -222,6 +235,8 @@ JSON parse fails on LLM response:
 ```
 
 No conversation history. No "fix this output" pattern. No assistant-turn injection surface.
+
+**Exception — zod validation failure**: when the JSON parses successfully but fails zod schema validation, the retry prompt includes the specific zod error paths (not the failed output itself). This is safe because error paths are system-generated strings, not attacker-controlled content. See the Zod Validation section below for the error-path feedback pattern.
 
 ## Nonce-Based Sanitization
 
@@ -266,7 +281,71 @@ Call sites parse with zod schemas (defined in PIPELINE.md), not the wrapper itse
 - **`MarketReportLLMSchema`** (Stage 3): `tldr` (max 500 chars), `keyEvents[]` (max 10),
   `entitySentiment[]` (max 15), `sections[]` (max 4), `newProjects[]` (max 5).
 
-On zod parse failure, the L7 retry path fires (fresh prompt, one retry, then skip).
+On zod parse failure, the L7 retry path fires with **error-path feedback**: extract specific zod error messages and include them in the retry prompt so the model knows exactly what to fix.
+
+```typescript
+if (!zodResult.success) {
+  const errorMessages = zodResult.error.issues.map(issue =>
+    `- ${issue.path.join('.')}: ${issue.message} (received: ${JSON.stringify(issue.received)})`
+  ).join('\n');
+
+  const retryResponse = await llm.call({
+    model: config.models.haiku,
+    system: STAGE1_SYSTEM_PROMPT,
+    prompt: `Your previous output had these validation errors:\n${errorMessages}\n\nFix ONLY these fields. Keep everything else the same.\n\nOriginal input:\n${chunk.content}`,
+    maxTokens: 3000
+  });
+}
+```
+
+This is safe because error-path strings are generated by zod, not from attacker content. The original failed output is never included in the retry prompt. If the retry also fails zod validation, skip the chunk and log the error.
+
+## Prompt Caching
+
+Anthropic automatically caches repeated prompt prefixes. Our Stage 1 system prompt (~2000 tokens) is identical across all ~50 daily Haiku calls. After the first call in a session, subsequent calls pay ~90% less for the cached system prompt tokens.
+
+### How It Works
+
+1. The first `llm.call()` with a given system prompt pays full price for all input tokens.
+2. Anthropic caches the system prompt prefix on their side.
+3. Calls 2-50 within the cache TTL (~5 minutes) pay ~10% of the original input cost for the cached portion.
+4. Pi AI passes through provider caching headers transparently.
+
+### Budget Hints (Decision 03)
+
+Stage 1 appends complexity-adaptive budget hints to the system prompt for sparse chunks:
+
+```typescript
+const isDense = chunk.estimatedEntities > 5
+  || chunk.tokenCount > 4000
+  || chunk.hasUrgencyKeywords;
+
+const budgetHint = isDense
+  ? '' // no constraint — let Haiku write freely
+  : 'Target ~400 tokens for the summary field. Be concise.';
+
+const systemPrompt = STAGE1_SYSTEM_PROMPT + (budgetHint ? `\n\n${budgetHint}` : '');
+```
+
+~70% of chunks are routine/sparse. Budget hints reduce output from ~1000 to ~400 tokens on these chunks, saving ~30-40% on Stage 1 output token costs.
+
+## Prompt Caching Verification
+
+Verify caching is active by comparing costs between the first and second Stage 1 calls:
+
+```typescript
+const response1 = await llm.call({ system: STAGE1_PROMPT, prompt: chunk1 });
+const response2 = await llm.call({ system: STAGE1_PROMPT, prompt: chunk2 });
+
+console.log('Call 1 input cost:', response1.usage.cost);
+console.log('Call 2 input cost:', response2.usage.cost);
+// If call 2 is ~90% cheaper on input, caching is working
+```
+
+If Pi AI does not pass through caching headers, options are:
+1. Add `cache-control` headers manually if the provider supports it.
+2. Accept the cost — system prompt is ~2000 tokens x $0.25/M = $0.0005 per call. 50 calls/day = $0.025/day. Caching saves ~$0.022/day. Not critical.
+3. File an issue on the Pi AI repo requesting cache passthrough.
 
 ## Error Code Quick Reference
 
