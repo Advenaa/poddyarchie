@@ -369,9 +369,15 @@ leakage, not adversarial attack.
 
 **Tool results need untrusted framing**: when Sonnet calls `semantic_search`,
 `keyword_search`, or `read_raw`, the retrieved content originates from the pipeline
-(which has already passed through Layers 1-5). However, tool results should still
-be framed as data, not instructions, in the Sonnet conversation — use the same
-XML wrapping pattern (Layer 3) around retrieved content injected into the chat context.
+(which has already passed through Layers 1-5). However, tool results must still
+be framed as data, not instructions, in the Sonnet conversation. Each tool result
+is wrapped in nonce-based `<tool_result_${nonce}>` tags (same Layer 3 pattern as
+scraped content). The nonce is generated per tool call via `crypto.randomBytes(4)`.
+Additionally, `read_raw` results are passed through `sanitizeForPrompt()` before
+wrapping, since they contain original source content that may not have had full
+sanitization applied at the display layer. `semantic_search` and `keyword_search`
+results are wrapped but not sanitized, as they return pipeline-generated summaries
+and entity data that have already passed through Layers 1-5.
 
 **Conversation history limits**: the chat handler maintains the last 5 messages
 in context. This bounds the attack surface for conversation-history-based injection

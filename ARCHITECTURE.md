@@ -119,7 +119,7 @@ Runs on every incoming item. Steps 1-5 are pure rule-based (no LLM calls). Step 
 2. **Dedup** — `sha256(source + sourceId + content.slice(0, 200))`. Plus exact URL match across sources after URL expansion. No SimHash for MVP — exact hash + URL dedup covers 90%.
 3. **URL expansion** — resolve t.co, bit.ly redirects for cross-source dedup.
 4. **Spam filter** — rule-based. English: bot accounts, sub-5-word posts, "gm/gn". Indonesian: "wm", "done min/sudah min", "gas!", "mantap", single-emoji, airdrop copypasta. Kills 40-60% of Discord volume.
-4.5. **Prompt injection scan** — InstructDetector scans content for injection attempts. Flagged items saved as `status: 'filtered'` with `filter_reason: 'injection_detected'`, not deleted. Results cached per content hash. Also applies Unicode normalization (NFC) and strips zero-width characters, direction overrides, and homoglyphs. Near-zero cost (no LLM calls). Part of the five-layer defense model: (1) Unicode normalize, (2) InstructDetector, (3) XML delimiter wrapping at LLM call, (4) entity post-verification on output, (5) privilege separation via zod validation.
+4.5. **Prompt injection scan** — InstructDetector scans content for injection attempts. Flagged items saved as `status: 'filtered'` with `filter_reason: 'injection_detected'`, not deleted. Results cached per content hash. Also applies Unicode normalization (NFKC) and strips zero-width characters, direction overrides, and homoglyphs. Near-zero cost (no LLM calls). Part of the five-layer defense model: (1) Unicode normalize, (2) InstructDetector, (3) XML delimiter wrapping at LLM call, (4) entity post-verification on output, (5) privilege separation via zod validation.
 5. **Language detection** — `franc` library. Process English (`eng`) and Indonesian (`ind`) — franc uses ISO 639-3 codes — exclude others. Indonesian is first-class.
 6. **Indonesian translation** — if detected language is `ind`, translate content to English via Haiku before saving as `ready`. Preserves entity names, numbers, and technical terms. Sets `original_language = 'ind'` and `translated = true` on the item. English content skips this step. Rationale: 14-17pp accuracy loss when LLMs process low-resource languages directly vs English input (Left Behind, Feb 2026; XBridge, Mar 2026).
 
@@ -865,9 +865,9 @@ At 5,000 items/day post-normalization:
 |-----------|-----------|------|
 | Stage 0 (code + InstructDetector) | — | $0 |
 | Indonesian translation (Haiku) | ~15-20 | ~$0.02-0.04 |
-| Stage 1 (Haiku, 12 batches, with budget hints) | ~30 | ~$0.03-0.04 |
+| Stage 1 (Haiku, with budget hints) | ~50 | ~$0.10 |
 | Confidence routing escalation (Sonnet) | ~2-3 | ~$0.02-0.05 |
-| Stage 2 (SQL + trust weight calc) | 12 | $0 |
+| Stage 2 (SQL + trust weight calc) | ~50 | $0 |
 | Narrative clustering (Haiku naming) | ~3-5 | ~$0.01 |
 | Entity disambiguation (Haiku, batched) | ~1-2 | ~$0.01 |
 | Synthesize — daily (Sonnet) | 1 | ~$0.05 |

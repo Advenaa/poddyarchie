@@ -60,7 +60,7 @@ function normalize(item: RawItem) {
   }
   
   // Layer 1: Unicode normalization + zero-width strip (Decision 06)
-  item.content = item.content.normalize('NFC');
+  item.content = item.content.normalize('NFKC');
   item.content = item.content.replace(/[\u200B-\u200F\u2028-\u202F\uFEFF]/g, '');
   
   // Layer 2: InstructDetector scan — prompt injection defense (Decision 06)
@@ -315,7 +315,9 @@ async function summarizeChunk(
   
   // Build the prompt (see PIPELINE.md for full system prompt)
   const systemPrompt = buildStage1Prompt(source, sourceId, windowStart, windowEnd) + budgetHint;
-  const userMessage = `<scraped_content>\n${formattedContent}\n</scraped_content>`;
+  // Nonce-based XML wrapping (Layer 3 defense, see docs/LLM.md)
+  const nonce = crypto.randomBytes(4).toString('hex');
+  const userMessage = `<scraped_content_${nonce}>\n${sanitizeForPrompt(formattedContent)}\n</scraped_content_${nonce}>`;
   
   // Call LLM through the wrapper (handles retries, errors, cost logging)
   const response = await llm.call({
@@ -326,13 +328,44 @@ async function summarizeChunk(
     stage: 'summarize'
   });
   
-  // Validate with zod
-  const parsed = ChunkSummarySchema.safeParse(JSON.parse(response.content));
+  // Validate with zod — wrap JSON.parse in try-catch for injection defense (Decision 06)
+  let jsonParsed: unknown;
+  try {
+    jsonParsed = JSON.parse(response.content);
+  } catch (e) {
+    if (e instanceof SyntaxError) {
+      // JSON parse failure — retry with fresh prompt, no history (attack #6 defense)
+      logger.warn({ source, sourceId }, 'Stage 1 JSON parse failed, retrying with fresh prompt');
+      const freshResponse = await llm.call({
+        model: config.models.haiku,
+        system: systemPrompt,
+        messages: [{ role: 'user', content: userMessage }],
+        maxTokens: 3000,
+        stage: 'summarize'
+      });
+      try {
+        const freshParsed = ChunkSummarySchema.safeParse(JSON.parse(freshResponse.content));
+        if (!freshParsed.success) {
+          logger.error({ source, sourceId, error: freshParsed.error }, 'Stage 1 parse failed after fresh retry');
+          return null;
+        }
+        return freshParsed.data;
+      } catch {
+        logger.error({ source, sourceId }, 'Stage 1 JSON parse failed twice, skipping chunk');
+        return null;
+      }
+    }
+    throw e;
+  }
+
+  const parsed = ChunkSummarySchema.safeParse(jsonParsed);
   
   if (!parsed.success) {
     // Retry with zod error-path feedback (Decision 08)
     // Feed specific error paths back so Haiku knows exactly what to fix.
     // PARSE (EMNLP 2025): 92% error reduction vs generic "try again" retry.
+    // Security: only send original userMessage + error descriptions — never include
+    // the failed assistant response in retry context (attack #6 defense).
     const errorMessages = parsed.error.issues.map(issue =>
       `- ${issue.path.join('.')}: ${issue.message} (received: ${JSON.stringify((issue as any).received)})`
     ).join('\n');
@@ -342,19 +375,23 @@ async function summarizeChunk(
       system: systemPrompt,
       messages: [
         { role: 'user', content: userMessage },
-        { role: 'assistant', content: response.content },
         { role: 'user', content: `Your previous output had these validation errors:\n${errorMessages}\n\nFix ONLY these fields. Keep everything else the same.` }
       ],
       maxTokens: 3000,
       stage: 'summarize'
     });
     
-    const retryParsed = ChunkSummarySchema.safeParse(JSON.parse(retryResponse.content));
-    if (!retryParsed.success) {
-      logger.error({ source, sourceId, error: retryParsed.error }, 'Stage 1 parse failed after retry');
-      return null;  // skip this chunk
+    try {
+      const retryParsed = ChunkSummarySchema.safeParse(JSON.parse(retryResponse.content));
+      if (!retryParsed.success) {
+        logger.error({ source, sourceId, error: retryParsed.error }, 'Stage 1 parse failed after retry');
+        return null;  // skip this chunk
+      }
+      return retryParsed.data;
+    } catch {
+      logger.error({ source, sourceId }, 'Stage 1 JSON parse failed on retry response');
+      return null;
     }
-    return retryParsed.data;
   }
   
   return parsed.data;
@@ -675,12 +712,24 @@ async function handleChat(userMessage: string, history: ChatMessage[]): Promise<
   });
   
   // Handle tool calls iteratively — Sonnet may chain multiple tools
+  // Tool results are framed as untrusted data with nonce-based XML tags (Layer 3 defense).
+  // read_raw results get sanitizeForPrompt() since they contain original source content.
   while (response.toolCalls?.length) {
-    const results = await executeToolCalls(response.toolCalls);
+    const rawResults = await executeToolCalls(response.toolCalls);
+    const framedResults = rawResults.map((result: ToolResult) => {
+      const resultNonce = crypto.randomBytes(4).toString('hex');
+      const content = result.toolName === 'read_raw'
+        ? sanitizeForPrompt(result.content)
+        : result.content;
+      return {
+        ...result,
+        content: `<tool_result_${resultNonce}>\n${content}\n</tool_result_${resultNonce}>`,
+      };
+    });
     response = await llm.call({
       model: config.models.sonnet,
       system: CHAT_SYSTEM_PROMPT,
-      messages: [...history, { role: 'user', content: userMessage }, ...results],
+      messages: [...history, { role: 'user', content: userMessage }, ...framedResults],
       tools: chatTools,
       maxTokens: 2000
     });

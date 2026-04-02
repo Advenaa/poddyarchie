@@ -959,6 +959,9 @@ New on Radar
 | Digest delivery | After Stage 3 daily | Webhook the report |
 | Entity decay | Daily 00:00 UTC | `relevance *= 0.95` for all entities |
 | Scraper health check | Every 5min | Reset `backoff` sources past `next_retry_at` |
+| Data retention | Daily 00:05 UTC | Delete old items (30d), summaries (90d), mentions (90d) |
+| Backup | Daily 00:10 UTC | pg_dump to DATA_DIR, clean after retention |
+| Health monitoring | Every 5min | 7 checks: source silence, LLM failures, missed pulse, missed daily, DB pool, cost spike. Alerts via ALERT_WEBHOOK_URL |
 
 ## Cost Tracking
 

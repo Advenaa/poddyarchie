@@ -27,7 +27,7 @@ Option C — Unicode normalization + InstructDetector + XML delimiter wrapping +
 ### Layer 1: Unicode Normalization (normalize step)
 ```typescript
 // One line in normalize pipeline
-item.content = item.content.normalize('NFC');
+item.content = item.content.normalize('NFKC');
 // Also strip zero-width characters, direction overrides, homoglyphs
 item.content = item.content.replace(/[\u200B-\u200F\u2028-\u202F\uFEFF]/g, '');
 ```
@@ -70,7 +70,7 @@ for (const entity of result.entities) {
 ### Pipeline Flow
 ```
 Message arrives
-  → Layer 1: Unicode normalize (NFC + strip zero-width)
+  → Layer 1: Unicode normalize (NFKC + strip zero-width)
   → Layer 2: InstructDetector scan (cached)
   → Existing: dedup, spam, language, truncation
   → Saved as 'ready' or 'filtered'

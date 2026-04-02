@@ -5,11 +5,11 @@ Every SQL query the system needs, organized by module. All live in `src/db/queri
 ## 1. Items
 
 ```typescript
-function insertItem(item: RawItem, contentHash: string, status: string, originalLanguage?: string, translated?: boolean): void
+function insertItem(item: RawItem, contentHash: string, status: string, originalLanguage?: string, translated?: boolean, filterReason?: string, contentAnchor?: string): void
 ```
 ```sql
-INSERT INTO items (id, source, source_id, author, content, timestamp, url, engagement, content_hash, status, original_language, translated, created_at)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+INSERT INTO items (id, source, source_id, author, content, timestamp, url, engagement, content_hash, status, original_language, translated, attachments, filter_reason, content_anchor, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
 ```
 
 ```typescript
@@ -277,7 +277,7 @@ Fallback after `INSERT ... ON CONFLICT DO NOTHING` fires (concurrent batch wrote
 function insertAlias(alias: string, entityId: string): void
 ```
 ```sql
-INSERT INTO entity_aliases (alias, entity_id) VALUES ($1, $2)
+INSERT INTO entity_aliases (alias, entity_id, context_key) VALUES ($1, $2, '')
 ON CONFLICT DO NOTHING
 ```
 

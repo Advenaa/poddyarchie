@@ -95,6 +95,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 | `API_KEY` | No | Auto-generated on first run if missing |
 | `DATABASE_URL` | Yes | Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/podders`) |
 | `PORT` | No | Default 3000 |
+| `DATA_DIR` | No | Backups location, default ./data |
 | `PUBLIC_URL` | No | For "View full report" links in webhooks |
 | `ALERT_WEBHOOK_URL` | No | Discord webhook for critical health alerts (separate channel) |
 
