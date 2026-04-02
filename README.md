@@ -202,13 +202,14 @@ Single process, one port. No Docker, no microservices.
 
 ## Cost
 
-~$1.55/day (~$47/month) for the full system:
+~$0.81-0.96/day (~$25-29/month) for the full system:
 - Stage 1 Haiku calls: ~$0.15/day
-- 8 Sonnet pulses: ~$0.90/day
+- 8 Sonnet pulses: ~$0.11/day
 - Daily synthesis: ~$0.05/day
 - Flash reports: ~$0.05/day
 - Chat: ~$0.15-0.30/day
-- Embeddings: $0 (Gemini free tier)
+- twitterapi.io: ~$0.30/day ($9/month)
+- Embeddings: $0 (Gemini free tier, 1,500 req/day limit)
 
 ---
 
