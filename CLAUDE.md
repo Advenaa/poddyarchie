@@ -37,12 +37,13 @@ src/
   server.ts          # Fastify routes + static serving
   logger.ts          # Pino + secret masking
   llm.ts             # All LLM calls go through here
+  embed.ts           # Gemini embeddings wrapper (text-embedding-004, retry, cost logging)
   url-validator.ts   # Shared SSRF protection
   scheduler.ts       # per-source poll intervals + mutex
   db/                # connection, migrations, queries
   auth/              # Discord OAuth2, sessions, middleware (requireAuth, requireAdmin)
   ingest/            # discord, twitter, news, rss adapters
-  normalize/         # dedup, spam filter, language detection, Indonesian→English translation via Haiku
+  normalize/         # 6-gate pipeline: truncation (>20K chars), content hash dedup, URL dedup (t.co expansion), spam filter, language detection (franc, eng/ind only), Indonesian→English translation via Haiku
   pre-summarize/     # Haiku pre-summary for long RSS/news articles (>4K chars)
   process/           # summarize (Stage 1), correlate (Stage 2), synthesize (Stage 3)
   knowledge/         # entity upsert, alias resolution, decay
@@ -83,7 +84,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 - **No event bus, no plugin system, no multi-agent** — direct function calls. Cron fires handler, handler calls next stage at end. Keep it simple.
 - **Per-source poll intervals** — each source defines its own `poll_interval` instead of a single global cron. The scheduler fires each source independently.
 - **Parallel source processing** — sources are processed concurrently, not sequentially. The scheduler launches source ingestion jobs in parallel.
-- **Raw Discord feed** — a raw feed API endpoint (`/api/raw-feed`) and dashboard view display unprocessed Discord messages. Discord attachments (images) are stored alongside messages.
+- **Raw Discord feed** — a raw feed API endpoint (`/api/v1/feed/:sourceId`) and dashboard view display unprocessed Discord messages. Discord attachments (images) are stored alongside messages.
 - **Crash recovery** — on startup, reset orphaned `processing` items back to `ready`. Batch-claiming SQL (`UPDATE ... WHERE status='ready'`) prevents double-processing.
 - **Overlap guard** — each cron job has a `running` mutex. If a job fires while the previous run is in-flight, skip and log warning.
 

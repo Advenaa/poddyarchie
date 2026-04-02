@@ -276,7 +276,7 @@ async function processSingleSource(source: string, sourceId: string) {
     // Save results as new aliases — self-improving, reduces future LLM calls
     for (const resolution of JSON.parse(response.text)) {
       const entity = ambiguousEntities[resolution.index - 1];
-      await insertAlias(entity.name, entity.contextKey, resolution.selectedId);
+      await insertContextAlias(entity.name, resolution.selectedId, entity.contextKey);
     }
   }
   

@@ -507,7 +507,13 @@ const shouldEscalate = stage1Result.confidence < 5
 
 if (shouldEscalate) {
   logger.info(`Escalating chunk ${chunk.id} to Sonnet (confidence: ${stage1Result.confidence}, urgency: ${stage1Result.urgency})`);
-  const sonnetResult = await processWithSonnet(chunk);
+  const sonnetResult = await llm.call({
+    model: config.models.sonnet,
+    system: systemPrompt,  // same Stage 1 system prompt
+    messages: [{ role: 'user', content: chunkContent }],
+    maxTokens: 3000,
+    stage: 'escalate'
+  });
   return sonnetResult;
 }
 
@@ -606,7 +612,7 @@ CREATE TABLE narratives (
 CREATE INDEX idx_narratives_date ON narratives(date DESC);
 ```
 
-**Cost**: 3-5 Haiku calls/day x ~200 tokens each = ~$0.01/day. Negligible.
+**Cost**: 3-5 Haiku calls/day x ~20 tokens each = negligible.
 
 ## Stage 3: Synthesize (Sonnet)
 
@@ -879,7 +885,7 @@ Stage 1 entity data for this window (ground truth — use to verify your framing
 
 **Delivery**: same Discord webhook but with a distinct embed color (muted grey `0x4A4A5A`). Title: `Market Pulse — HH:MM WIB`. No "View full report" link (too lightweight for dashboard).
 
-**Cost**: one Sonnet call per 3h window. ~$0.02/pulse, ~$0.16/day (8 pulses).
+**Cost**: one Sonnet call per 3h window. ~$0.02/pulse, ~$0.14/day (8 pulses).
 
 ### Quality Gate (skip bland reports)
 

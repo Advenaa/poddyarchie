@@ -380,7 +380,6 @@ CREATE TABLE entity_mentions (
   created_at INTEGER NOT NULL
 );
 CREATE INDEX idx_mentions_entity_ts ON entity_mentions(created_at, entity_id);
-CREATE INDEX idx_mentions_created_entity ON entity_mentions(created_at, entity_id);
 ```
 
 **reports**
@@ -498,6 +497,22 @@ CREATE INDEX idx_narratives_date ON narratives(date DESC);
 ```
 
 Narratives are detected daily before Stage 3 synthesis by clustering existing summary embeddings (k-means with auto-tuned k via silhouette score). Clusters with 3+ members are named by Haiku (~3-5 calls/day). Signal strength classified by comparing member count to previous day: 3x growth = strong, 1.5x = emerging, halved = fading. Fed to Sonnet as context in daily synthesis prompt, telling the model WHY trends are happening (not just WHAT entities and HOW sentiment).
+
+**embeddings**
+```sql
+CREATE TABLE embeddings (
+  id TEXT PRIMARY KEY,                  -- ULID
+  target_type TEXT NOT NULL,            -- item | summary | entity | report
+  target_id TEXT NOT NULL,              -- FK to items.id, summaries.id, etc.
+  model TEXT NOT NULL,                  -- 'text-embedding-004' (for migration tracking)
+  dimensions INTEGER NOT NULL,          -- 768
+  vector BYTEA NOT NULL,               -- Float32Array as raw bytes (768 * 4 = 3072 bytes)
+  created_at INTEGER NOT NULL,
+  UNIQUE(target_type, target_id)
+);
+CREATE INDEX idx_embeddings_target ON embeddings(target_type, target_id);
+CREATE INDEX idx_embeddings_type ON embeddings(target_type, created_at);
+```
 
 ### Schema Versioning
 
@@ -661,7 +676,7 @@ All endpoints: `/api/v1/*`. Most require authentication (session cookie or `Auth
 | `GET` | `/api/v1/auth/discord/callback` | OAuth2 callback — exchanges code, creates session, sets cookie, redirects to `/` |
 | `GET` | `/api/v1/auth/me` | `{ user: { discordId, username, avatar, role } }` or 401 if not authenticated |
 | `POST` | `/api/v1/auth/logout` | Destroys session, clears cookie. `{ ok: true }` |
-| `GET` | `/api/v1/health` | Health check (public) |
+| `GET` | `/api/v1/health` | `{ events: HealthEvent[], sourceStates: SourceState[], lastPulse: number, lastDaily: number, cost24h: number }` — unacknowledged events + system vitals (public, no auth required) |
 
 **User Management (admin-only):**
 
@@ -699,7 +714,6 @@ All endpoints: `/api/v1/*`. Most require authentication (session cookie or `Auth
 | `GET` | `/api/v1/config` | `{ webhookUrl, digestTime, timezone, publicUrl }` |
 | `PATCH` | `/api/v1/config` | Body: partial of above |
 | `GET` | `/api/v1/status` | `{ stages: { ingest, summarize, synthesize, delivery }, llmCostToday, allSourcesDisabled: bool }` |
-| `GET` | `/api/v1/health` | `{ events: HealthEvent[], sourceStates: SourceState[], lastPulse: number, lastDaily: number, cost24h: number }` — unacknowledged events + system vitals |
 | `PATCH` | `/api/v1/health/:id` | Acknowledge a health event |
 | `POST` | `/api/v1/auth/rotate` | `{ apiKey: "new-key-displayed-once" }` |
 
@@ -707,7 +721,7 @@ All endpoints: `/api/v1/*`. Most require authentication (session cookie or `Auth
 
 | Method | Path | Response |
 |--------|------|----------|
-| `GET` | `/api/v1/search?q=solana&days=7` | `{ items: [{ id, source, author, content, timestamp }] }` — Postgres `tsvector`/`tsquery` with optional time filter |
+| `GET` | `/api/v1/search?q=<query>&days=<n>&mode=semantic\|keyword` | `{ items: [{ id, source, author, content, timestamp }] }` — `mode` defaults to `keyword` (Postgres `tsvector`/`tsquery`); `semantic` uses Gemini embeddings + cosine similarity. Optional `days` time filter |
 
 **Feed (raw item feed per source):**
 
@@ -759,7 +773,7 @@ Sonnet calls tools iteratively until it has enough context, then generates a gro
 |--------|------|----------|
 | `POST` | `/api/v1/sources/:source/:sourceId/reset` | `{ ok: true }` — reset `error_count` to 0 and status to `active` |
 
-35 endpoints total.
+33 endpoints total.
 
 ### Webhook Content
 
@@ -965,12 +979,12 @@ At 5,000 items/day post-normalization:
 | Entity disambiguation (Haiku, batched) | ~1-2 | ~$0.01 |
 | Synthesize — daily (Sonnet) | 1 | ~$0.05 |
 | Synthesize — flash (Sonnet, rare) | ~0-1 | ~$0.05 |
-| Pulse (Sonnet, every 3h) | 8 | ~$0.11 |
+| Pulse (Sonnet, every 3h) | 8 | ~$0.14 |
 | Chat (Sonnet, tool-based RAG, user-driven) | ~10-20 | ~$0.15-0.30 |
 | Twitter (twitterapi.io) | ~2K tweets | ~$0.30/day |
 | Trust weight adjustment (SQL) | — | $0 |
 | Entity archival (SQL) | — | $0 |
-| **Total** | | **~$0.82-1.06/day (~$25-32/month)** |
+| **Total** | | **~$0.80-1.05/day (~$24-32/month)** |
 
 **Prompt caching**: Stage 1 system prompt (~2K tokens) is identical across ~50 daily Haiku calls. Anthropic caches repeated prefixes automatically — after the first call, ~90% savings on system prompt input tokens. Verify Pi AI passes through caching headers; if not, savings are ~$0.02/day lower. Net effect already reflected in Stage 1 estimate above.
 

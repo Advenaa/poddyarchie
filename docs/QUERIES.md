@@ -653,3 +653,40 @@ async function cleanupExpiredSessions(): Promise<number>
 DELETE FROM sessions WHERE expires_at < $1 RETURNING id
 ```
 Returns count of deleted sessions.
+
+## 15. Author Sentiment (P1)
+
+```typescript
+// src/process/author-sentiment.ts
+
+async function upsertAuthorSentiment(author: string, source: string, windowStart: number, sentiment: number, messageCount: number): Promise<void>
+```
+```sql
+INSERT INTO author_sentiment (author, source, window_start, sentiment, message_count)
+VALUES ($1, $2, $3, $4, $5)
+ON CONFLICT (author, source, window_start) DO UPDATE SET sentiment = $4, message_count = $5
+```
+
+```typescript
+async function getAuthorSentimentHistory(author: string, source: string, days: number): Promise<AuthorSentiment[]>
+```
+```sql
+SELECT * FROM author_sentiment
+WHERE author = $1 AND source = $2 AND window_start > $3
+ORDER BY window_start DESC
+```
+
+```typescript
+async function getAuthorSentimentDeviations(threshold: number): Promise<AuthorDeviation[]>
+```
+```sql
+-- Finds authors whose current window sentiment deviates > threshold from their 30-day rolling average
+SELECT a.author, a.source, a.sentiment AS current, AVG(h.sentiment) AS avg_30d,
+  ABS(a.sentiment - AVG(h.sentiment)) AS deviation
+FROM author_sentiment a
+JOIN author_sentiment h ON a.author = h.author AND a.source = h.source
+  AND h.window_start > $2 AND h.window_start < a.window_start
+WHERE a.window_start = (SELECT MAX(window_start) FROM author_sentiment WHERE author = a.author AND source = a.source)
+GROUP BY a.author, a.source, a.sentiment
+HAVING ABS(a.sentiment - AVG(h.sentiment)) > $1
+```

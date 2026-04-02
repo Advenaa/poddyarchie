@@ -117,9 +117,9 @@ The daily decay applies a flat 5% reduction: `relevance = relevance * 0.95`. Men
 
 | Source | Weight | Rationale |
 |--------|--------|-----------|
-| News | 3x | Rarest and highest signal — a news mention is editorially curated |
-| Twitter | 2x | Moderate signal — public but noisy |
-| Discord | 1x (base) | Highest volume, most noise |
+| News | 2.0 | Rarest and highest signal — a news mention is editorially curated |
+| Twitter | 1.5 | Moderate signal — public but noisy |
+| Discord | 1.0 (base) | Highest volume, most noise |
 
 News is weighted highest because news mentions are rarest and highest signal. Discord is lowest because volume is highest and noise is greatest.
 
@@ -209,15 +209,23 @@ Handles ~95% of entities instantly.
 
 ### Tier 2: Context-Based Disambiguation (free)
 
-When an alias maps to multiple candidates, check co-occurring entities from the same chunk as free context signal:
+When an alias maps to multiple candidates, check co-occurring entities from the same chunk as free context signal. Look up which entities appear alongside each candidate in recent summaries (via entity_mentions + summaries tables):
 
 ```typescript
 if (alias.candidates.length > 1) {
   const coEntities = context; // other entity names from same chunk
   for (const candidate of alias.candidates) {
-    const candidateAliases = await getEntityAliases(candidate.id);
+    // Find entities that co-occur with this candidate in recent summaries
+    const coOccurring = await db.query(`
+      SELECT DISTINCT e.name FROM entity_mentions em1
+      JOIN entity_mentions em2 ON em1.summary_id = em2.summary_id
+      JOIN entities e ON e.id = em2.entity_id
+      WHERE em1.entity_id = $1 AND em2.entity_id != $1
+      ORDER BY em1.summary_id DESC LIMIT 50
+    `, [candidate.id]);
+    const coOccurringNames = coOccurring.rows.map(r => r.name.toLowerCase());
     const contextOverlap = coEntities.filter(e =>
-      candidateAliases.some(a => a.relatedEntities?.includes(e))
+      coOccurringNames.includes(e.toLowerCase())
     );
     if (contextOverlap.length >= 2) {
       return candidate; // context strongly suggests this candidate
