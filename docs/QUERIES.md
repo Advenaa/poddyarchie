@@ -552,3 +552,104 @@ function reindexSearch(): void
 REINDEX INDEX items_content_tsvector_idx
 ```
 Rebuilds the full-text search index after bulk deletes. Run last in the retention cron.
+
+## 13. Users
+
+All live in `src/auth/session.ts`.
+
+```typescript
+async function upsertUser(discordId: string, username: string, avatar: string | null): Promise<void>
+```
+```sql
+INSERT INTO users (discord_id, username, avatar, role, created_at, last_login_at)
+VALUES ($1, $2, $3, 'viewer', $4, $4)
+ON CONFLICT (discord_id) DO UPDATE SET username = $2, avatar = $3, last_login_at = $4
+```
+
+```typescript
+async function getUser(discordId: string): Promise<User | null>
+```
+```sql
+SELECT discord_id, username, avatar, role, created_at, last_login_at
+FROM users WHERE discord_id = $1
+```
+
+```typescript
+async function listUsers(): Promise<User[]>
+```
+```sql
+SELECT discord_id, username, avatar, role, created_at, last_login_at
+FROM users WHERE role != 'blocked' ORDER BY created_at
+```
+
+```typescript
+async function updateUserRole(discordId: string, role: 'admin' | 'viewer' | 'blocked'): Promise<void>
+```
+```sql
+UPDATE users SET role = $2 WHERE discord_id = $1
+```
+If `role = 'blocked'`: also calls `destroyAllSessionsForUser(discordId)` to revoke all active sessions immediately.
+
+```typescript
+async function deleteUser(discordId: string): Promise<void>
+```
+```sql
+DELETE FROM users WHERE discord_id = $1
+```
+CASCADE deletes sessions.
+
+## 14. Sessions
+
+All live in `src/auth/session.ts`.
+
+```typescript
+async function createSession(discordId: string, ip: string, userAgent: string): Promise<string>
+```
+Returns a session ULID. First enforces the max-5-sessions-per-user cap by deleting the oldest:
+```sql
+DELETE FROM sessions WHERE discord_id = $1
+  AND id NOT IN (SELECT id FROM sessions WHERE discord_id = $1 ORDER BY created_at DESC LIMIT 4)
+```
+Then inserts the new session:
+```sql
+INSERT INTO sessions (id, discord_id, expires_at, last_refreshed_at, created_at, ip_address, user_agent)
+VALUES ($1, $2, $3, $4, $4, $5, $6)
+```
+
+```typescript
+async function getSession(sessionId: string): Promise<Session | null>
+```
+```sql
+SELECT s.id, s.discord_id, s.expires_at, s.last_refreshed_at, u.username, u.avatar, u.role
+FROM sessions s JOIN users u ON s.discord_id = u.discord_id
+WHERE s.id = $1 AND s.expires_at > $2
+```
+
+```typescript
+async function refreshSession(sessionId: string): Promise<void>
+```
+```sql
+UPDATE sessions SET expires_at = $2, last_refreshed_at = $3 WHERE id = $1
+```
+
+```typescript
+async function destroySession(sessionId: string): Promise<void>
+```
+```sql
+DELETE FROM sessions WHERE id = $1
+```
+
+```typescript
+async function destroyAllSessionsForUser(discordId: string): Promise<void>
+```
+```sql
+DELETE FROM sessions WHERE discord_id = $1
+```
+
+```typescript
+async function cleanupExpiredSessions(): Promise<number>
+```
+```sql
+DELETE FROM sessions WHERE expires_at < $1 RETURNING id
+```
+Returns count of deleted sessions.

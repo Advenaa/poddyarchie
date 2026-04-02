@@ -386,7 +386,45 @@ call on user-supplied conversation history.
 
 ---
 
-## 10. Key Rotation
+## 10. Authentication & Session Security
+
+### Discord OAuth2 Flow
+
+- **State parameter**: 32 random bytes stored in a short-lived httpOnly cookie (10 min maxAge). Validated on callback, cleared after use. Prevents CSRF on the OAuth callback endpoint.
+- **Discord access tokens**: used once (to fetch user info), never stored. No refresh tokens requested — the `offline_access` scope is not included.
+
+### Session Security
+
+- **Cookie flags**: `httpOnly` (no JS access), `secure` (HTTPS only), `sameSite: lax` (allows OAuth redirect, blocks cross-origin POST), `signed` (HMAC with `SESSION_SECRET`).
+- **DB-backed sessions**: sessions are stored in the `sessions` table and are revocable — blocking a user destroys all their sessions immediately via `destroyAllSessionsForUser()`.
+- **Max 5 sessions per user**: the oldest session is deleted when a 6th is created.
+- **30-day expiry with sliding refresh**: each request extends the session by 30 days from now.
+- **Opaque session IDs**: session IDs are ULIDs. No secrets are stored in the `sessions` table.
+- **`SESSION_SECRET`**: auto-generated on first run, stored in `app_config` (follows existing `API_KEY` pattern).
+
+### Authorization Model
+
+- **Three roles**: `admin`, `viewer`, `blocked`.
+- **`ADMIN_USER_IDS` env var**: comma-separated Discord IDs that are immutable bootstrap admins. These cannot be demoted via the DB.
+- **Invite-only**: no public registration. A user must already exist in the `users` table to log in.
+- **API key auth coexists**: API key authentication continues to work alongside Discord OAuth. API key sessions always resolve to `admin` role.
+- **Role resolution order**: env var check first (`ADMIN_USER_IDS`), then DB lookup (`users.role`).
+
+### Auth Logging
+
+- Log all login attempts (success and failure) with Discord ID and IP address.
+- Log session creation and destruction events.
+- Mask session cookie values in Pino logs (added to the existing secret masking list).
+
+### Residual Risks
+
+- **Discord account compromise = Podders access**: mitigated by invite-only (attacker must compromise an account that is already in the `users` table).
+- **Session cookie theft via XSS**: mitigated by `httpOnly` cookie flag + CSP headers (`img-src 'self' https://cdn.discordapp.com` — Discord CDN allowlisted for avatars only).
+- **`SESSION_SECRET` in `app_config` table**: follows the existing pattern for `API_KEY`. Same DB-access-implies-compromise threat model.
+
+---
+
+## 11. Key Rotation
 
 How each secret behaves during rotation.
 
@@ -396,6 +434,8 @@ How each secret behaves during rotation.
 | `DISCORD_TOKENS` | Update `.env`, restart process | WebSocket disconnects and reconnects with the new token on restart. Expect ~5-10s of missed messages (same as any restart). |
 | `TWITTERAPI_KEY` | Update `.env`, restart process | Next poll uses the new key. No in-flight concern (REST, not streaming). |
 | `API_KEY` (dashboard auth) | Rotate via settings endpoint (`POST /api/v1/auth/rotate`) | Can be rotated without restart. Active sessions are invalidated immediately. |
+| `SESSION_SECRET` | Update `.env` or `app_config`, restart process | All existing sessions invalidated (cookies can't be verified with new secret). Users must re-login. |
+| `DISCORD_CLIENT_SECRET` | Rotate in Discord Developer Portal, update `.env`, restart process | In-flight OAuth flows fail (code exchange uses the secret). New logins use the new secret. Existing sessions unaffected (sessions are independent of the OAuth secret). |
 
 **Recommendations**:
 - Rotate all keys quarterly as a matter of hygiene.

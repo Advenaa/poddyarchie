@@ -208,6 +208,26 @@ gunzip < /var/backups/podders/podders_YYYYMMDD.sql.gz | psql podders_restore_tes
 dropdb podders_restore_test
 ```
 
+## Discord OAuth2 (Dashboard Auth)
+
+Dashboard login uses Discord OAuth2. This is separate from the bot — `DISCORD_CLIENT_ID` / `DISCORD_CLIENT_SECRET` are for user login, `DISCORD_BOT_TOKEN` / `DISCORD_TOKENS` are for scraping.
+
+### Environment Variables
+
+| Var | Required | Notes |
+|-----|----------|-------|
+| `DISCORD_CLIENT_ID` | Yes (for dashboard auth) | Discord OAuth2 application client ID |
+| `DISCORD_CLIENT_SECRET` | Yes (for dashboard auth) | Discord OAuth2 application client secret |
+| `ADMIN_USER_IDS` | Yes | Comma-separated Discord user IDs with admin access |
+| `SESSION_SECRET` | No | 32-byte hex for signing session cookies. Auto-generated on first run, stored in `app_config` |
+
+### Discord Developer Portal Setup
+
+1. Create a new application at https://discord.com/developers/applications (or reuse existing).
+2. Under **OAuth2**, add a redirect URI: `{PUBLIC_URL}/api/v1/auth/discord/callback`.
+3. Copy the Client ID and Client Secret into `DISCORD_CLIENT_ID` and `DISCORD_CLIENT_SECRET`.
+4. `PUBLIC_URL` must be set when using Discord auth — the server needs it to build the callback URL.
+
 ## Secret Rotation
 
 | Secret | Procedure | Downtime |
@@ -217,6 +237,13 @@ dropdb podders_restore_test
 | `ANTHROPIC_API_KEY` | Update `.env`, restart | ~5-10s |
 | `GEMINI_API_KEY` | Update `.env`, restart | ~5-10s |
 | `TWITTERAPI_KEY` | Update `.env`, restart | ~5-10s |
+| `SESSION_SECRET` | Update `.env` or `app_config`, restart | ~5-10s |
+| `DISCORD_CLIENT_SECRET` | Rotate in Discord Developer Portal, update `.env`, restart | ~5-10s |
+
+### Session & OAuth Secret Details
+
+- **`SESSION_SECRET` rotation**: update the env var (or the value in `app_config`), restart the server. All existing sessions are invalidated — cookies signed with the old secret can't be verified. Users must re-login via Discord OAuth.
+- **`DISCORD_CLIENT_SECRET` rotation**: rotate the secret in the Discord Developer Portal first, then update the env var and restart. In-flight OAuth flows will fail; users retry and it works.
 
 ## Postgres Storage
 

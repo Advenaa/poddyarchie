@@ -192,9 +192,21 @@ Every summary, report, and entity gets turned into a vector (768 numbers via Goo
 | LLM | Claude — Haiku for Stage 1, Sonnet for synthesis/pulse/chat |
 | Embeddings | Google Gemini text-embedding-004 (768 dims, free tier) |
 | Twitter | twitterapi.io REST API |
+| Auth | Discord OAuth2 + @fastify/cookie (DB-backed sessions) |
 | Deploy | pm2 or systemd on VPS |
 
 Single process, one port. No Docker, no microservices.
+
+---
+
+## Authentication
+
+Dashboard access requires Discord login. OAuth2 flow with `identify` scope — no email or server permissions needed. Three roles:
+- **Admin** — full access (sources, settings, user management)
+- **Viewer** — read-only (reports, chat, raw feed)
+- **Blocked** — no access
+
+Bootstrap admins are set via `ADMIN_USER_IDS` env var. Additional users invited by admins. API key auth still works for programmatic access.
 
 ---
 

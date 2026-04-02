@@ -40,7 +40,7 @@ CREATE TABLE sources (
 );
 ```
 
-`.env` holds secrets only: `ANTHROPIC_API_KEY` (required if using Claude models, other provider keys as needed), `DATABASE_URL` (Postgres connection string, required), `DISCORD_TOKENS` (optional — needed for Discord sources), `TWITTERAPI_KEY` (optional — needed for Twitter sources), `API_KEY` (auto-generated if missing).
+`.env` holds secrets only: `ANTHROPIC_API_KEY` (required if using Claude models, other provider keys as needed), `DATABASE_URL` (Postgres connection string, required), `DISCORD_TOKENS` (optional — needed for Discord sources), `DISCORD_CLIENT_ID` + `DISCORD_CLIENT_SECRET` (optional — needed for Discord OAuth2 auth), `TWITTERAPI_KEY` (optional — needed for Twitter sources), `API_KEY` (auto-generated if missing), `ADMIN_USER_IDS` (optional — bootstrap admin Discord IDs).
 
 ### Discord Gateway
 
@@ -401,13 +401,42 @@ CREATE INDEX idx_reports_date ON reports(date);
 -- Flash/pulse reports: multiple per day allowed
 ```
 
+**users**
+```sql
+CREATE TABLE users (
+  discord_id TEXT PRIMARY KEY,
+  username TEXT NOT NULL,
+  avatar TEXT,
+  role TEXT NOT NULL DEFAULT 'viewer',  -- admin | viewer | blocked
+  created_at INTEGER NOT NULL,
+  last_login_at INTEGER
+);
+```
+
+Note: `users.discord_id` uses Discord snowflake as PK (not ULID) — it's an external ID.
+
+**sessions**
+```sql
+CREATE TABLE sessions (
+  id TEXT PRIMARY KEY,                  -- ULID
+  discord_id TEXT NOT NULL REFERENCES users(discord_id) ON DELETE CASCADE,
+  expires_at INTEGER NOT NULL,
+  last_refreshed_at INTEGER NOT NULL,
+  created_at INTEGER NOT NULL,
+  ip_address TEXT,
+  user_agent TEXT
+);
+CREATE INDEX idx_sessions_discord_id ON sessions(discord_id);
+CREATE INDEX idx_sessions_expires ON sessions(expires_at);
+```
+
 **app_config**
 ```sql
 CREATE TABLE app_config (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
 );
--- Seeds: webhook_url, digest_time ('09:00'), timezone ('Asia/Jakarta'), api_key_hash
+-- Seeds: webhook_url, digest_time ('09:00'), timezone ('Asia/Jakarta'), api_key_hash, session_secret
 ```
 
 **llm_usage**
@@ -549,12 +578,49 @@ Discord webhook delivery. The habit trigger — proves the pipeline end-to-end b
 
 ### Auth
 
-**API key** in `Authorization: Bearer <key>` header. Generated on first run. **Stored as argon2 hash** in `app_config` — raw key displayed once at generation, never again.
+#### Discord OAuth2
+
+Primary authentication via Discord OAuth2 code grant flow:
+
+- **Scope**: `identify` only — no guild access, no message reading.
+- **Flow**: `GET /api/v1/auth/discord` redirects to Discord → user authorizes → Discord redirects to `/api/v1/auth/discord/callback` with code → server exchanges code for access token → fetches user profile → creates/updates `users` row → creates session → sets signed httpOnly cookie.
+- **Invite-only**: no public registration. User must exist in `users` table (invited by admin) before OAuth succeeds. Unknown Discord IDs are rejected with 403.
+- **Roles**: three roles — `admin` (full access), `viewer` (read-only dashboard), `blocked` (rejected at login).
+- **Bootstrap admins**: `ADMIN_USER_IDS` env var (comma-separated Discord snowflake IDs). These users are always treated as admin regardless of DB role. Auto-created in `users` table on first login.
+
+#### Session Management
+
+- DB-backed sessions in `sessions` table. Session ID is a ULID per project convention.
+- **Cookie**: signed httpOnly cookie (`podders_session`). Config: `httpOnly: true`, `secure: true`, `sameSite: 'lax'`, `path: '/'`, `maxAge: 30 days`. Signed via `@fastify/cookie` with `SESSION_SECRET`.
+- **Expiry**: 30-day expiry with sliding refresh — if `last_refreshed_at` is >24h old on a valid request, update `last_refreshed_at` and reset cookie `maxAge`.
+- **Max sessions**: 5 per user. On new login, if at limit, delete the oldest session.
+- **Cleanup**: expired sessions purged during the daily retention cron (alongside item/entity cleanup).
+
+#### API Key Coexistence
+
+`Authorization: Bearer <key>` header still works. API key auth always grants admin role. Useful for scripts, CI, external integrations.
 
 - `POST /api/v1/auth/rotate` — generate new key, invalidate old
 - Rate limiting on failed auth: 5 failures/min per IP via `@fastify/rate-limit`
 
-Multi-user escape hatch: config tables have `user_id TEXT DEFAULT 'default'` for non-destructive migration later.
+#### Route Protection
+
+Fastify scoped registers with `onRequest` hooks:
+
+- **`requireAuth`** — checks session cookie OR Bearer API key. Sets `request.user` with `{ discordId, role }`. Returns 401 if neither valid.
+- **`requireAdmin`** — runs after `requireAuth`, checks `role === 'admin'`. Returns 403 if not admin.
+
+Public routes (health, auth flow) are registered outside the auth scope. All other `/api/v1/*` routes require at least `requireAuth`.
+
+#### Auth Logging
+
+- Log all login attempts (success and failure) with Discord ID and IP address.
+- Log session creation and destruction events.
+- Mask `podders_session` cookie value in Pino logs (added to the existing secret masking list in `logger.ts`).
+
+#### Dependency
+
+One new dependency: `@fastify/cookie` (cookie parsing and signing).
 
 ### Input Validation
 
@@ -568,7 +634,7 @@ All API routes use **Fastify JSON Schema validation**:
 ### Security Headers
 
 `server.ts` sets on all responses:
-- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'`
+- `Content-Security-Policy: default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https://cdn.discordapp.com`
 - `X-Frame-Options: DENY`
 - `X-Content-Type-Options: nosniff`
 - `Referrer-Policy: strict-origin-when-cross-origin`
@@ -585,7 +651,26 @@ Used by RSS fetcher, webhook delivery, and news extractor:
 
 ### API Contract
 
-All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
+All endpoints: `/api/v1/*`. Most require authentication (session cookie or `Authorization: Bearer <api_key>`).
+
+**Auth (public — no auth required):**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `GET` | `/api/v1/auth/discord` | Redirects to Discord OAuth2 authorization page |
+| `GET` | `/api/v1/auth/discord/callback` | OAuth2 callback — exchanges code, creates session, sets cookie, redirects to `/` |
+| `GET` | `/api/v1/auth/me` | `{ user: { discordId, username, avatar, role } }` or 401 if not authenticated |
+| `POST` | `/api/v1/auth/logout` | Destroys session, clears cookie. `{ ok: true }` |
+| `GET` | `/api/v1/health` | Health check (public) |
+
+**User Management (admin-only):**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `GET` | `/api/v1/users` | `{ users: [{ discordId, username, avatar, role, createdAt, lastLoginAt }] }` |
+| `POST` | `/api/v1/users` | Body: `{ discordId, role }`. Invite user. |
+| `PATCH` | `/api/v1/users/:discordId` | Body: `{ role }`. Change role. |
+| `DELETE` | `/api/v1/users/:discordId` | Remove user (revokes all sessions). |
 
 **Reports:**
 
@@ -630,7 +715,7 @@ All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
 |--------|------|----------|
 | `GET` | `/api/v1/feed/:sourceId` | `{ items: [{ id, source, author, content, timestamp, attachments, engagement }] }` — raw items filtered by source, paginated `?limit=50&offset=0` |
 
-**Chat (RAG):**
+**Chat (RAG)** — requires `requireAuth`:
 
 | Method | Path | Response |
 |--------|------|----------|
@@ -674,7 +759,7 @@ Sonnet calls tools iteratively until it has enough context, then generates a gro
 |--------|------|----------|
 | `POST` | `/api/v1/sources/:source/:sourceId/reset` | `{ ok: true }` — reset `error_count` to 0 and status to `active` |
 
-26 endpoints total.
+35 endpoints total.
 
 ### Webhook Content
 
@@ -726,6 +811,10 @@ Trap SIGTERM/SIGINT:
 | `TWITTERAPI_KEY` | No | twitterapi.io API key for Twitter scraping |
 | `DATABASE_URL` | Yes | Postgres connection string (e.g., `postgres://user:pass@localhost:5432/podders`) |
 | `API_KEY` | No | Dashboard API key (auto-generated if missing) |
+| `DISCORD_CLIENT_ID` | Yes (for auth) | Discord OAuth2 application client ID (required for Discord auth) |
+| `DISCORD_CLIENT_SECRET` | Yes (for auth) | Discord OAuth2 application client secret (required for Discord auth) |
+| `ADMIN_USER_IDS` | Yes | Comma-separated Discord snowflake IDs — always treated as admin |
+| `SESSION_SECRET` | No | 32-byte hex for signing session cookies. Auto-generated on first run, stored in `app_config` |
 | `PORT` | No | Default 3000 |
 | `DATA_DIR` | No | Backups location, default `./data` |
 | `PUBLIC_URL` | No | Dashboard URL for webhook links (e.g., `https://podders.yourdomain.com`) |
@@ -751,7 +840,7 @@ Trap SIGTERM/SIGINT:
 | LLM validation | zod              | LLM output parsing + enforcement |
 | API validation | Fastify JSON Schema | Route-level input validation    |
 | Twitter   | twitterapi.io          | Pay-per-use, $0.15/1K tweets     |
-| Auth      | argon2                | API key hashing                  |
+| Auth      | argon2 + @fastify/cookie | API key hashing + session cookies |
 | Discord   | ws                    | Gateway WebSocket connections    |
 | RSS       | rss-parser              | RSS/Atom feed parsing              |
 | News      | @mozilla/readability + linkedom | Article content extraction |
@@ -776,6 +865,10 @@ podders/
 │   │   ├── connection.ts     # Postgres connection pool (pg.Pool)
 │   │   ├── migrations.ts     # Schema creation + versioned migrations
 │   │   └── queries.ts        # All queries (async)
+│   ├── auth/
+│   │   ├── discord-oauth.ts  # OAuth2 flow (authorize, callback, token exchange)
+│   │   ├── sessions.ts       # Session CRUD (create, validate, refresh, cleanup)
+│   │   └── middleware.ts      # requireAuth + requireAdmin onRequest hooks
 │   ├── ingest/
 │   │   ├── types.ts          # RawItem, SourceAdapter interface
 │   │   ├── discord.ts        # Discord Gateway (multi-token, per-connection)
@@ -852,7 +945,7 @@ podders/
 - Entity explorer (v2.1)
 - Pretext engine (v2.1)
 - Email / web push delivery (v2.1)
-- OAuth / multi-user (v2.1)
+- Multi-tenant / workspace isolation (v2.1)
 - Redis / message queues
 - Vector embeddings — **Phase 1 core capability**, see [docs/EMBEDDINGS.md](./docs/EMBEDDINGS.md)
 - Plugin/skill system
@@ -883,7 +976,7 @@ At 5,000 items/day post-normalization:
 
 ## Build Order
 
-1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, source_rate_history, app_config, embeddings, health_events, narratives)
+1. Database schema + migrations (core tables: items, summaries, reports, sources, source_state, source_rate_history, app_config, embeddings, health_events, narratives, users, sessions)
 2. `llm.ts` wrapper (error taxonomy, retry, token counting)
 3. `embed.ts` wrapper (Gemini text-embedding-004, retry, cost logging)
 4. RSS ingestion (simplest source — `rss-parser` + normalize)
@@ -903,22 +996,23 @@ At 5,000 items/day post-normalization:
 16. Twitter/X via twitterapi.io
 17. News article extraction (Readability)
 18. Stage 2 correlate (SQL cross-source signals — needs multiple sources)
-19. Dashboard (Vite scaffold + report view + settings + chat panel + search UI toggle)
+19. Auth (Discord OAuth2 flow, session management, requireAuth/requireAdmin hooks, user management endpoints, @fastify/cookie)
+20. Dashboard (Vite scaffold + report view + settings + chat panel + search UI toggle)
 
 Steps 15-17 are independent and can be built in parallel.
 
-20. Entity tables (entities, entity_aliases with context_key, entity_mentions) + three-tier resolution from summary JSON
-21. CoinGecko seeding + Indonesian entity seeds
-22. Entity relevance decay + archival cron (archive instead of delete, reactivation on re-mention)
-22.5. Trust weight auto-adjustment (SQL, runs 1h after each flash alert, ±0.2 bounds from initial weight)
-22.6. Narrative clustering (k-means on summary embeddings, Haiku naming, signal strength classification, narratives table)
-23. Item embedding (batch cron every 15 min) + entity embedding (inline on create/update)
-24. Postgres full-text search (tsvector/tsquery) + search endpoint (keyword fallback)
-25. `llm_usage` table + cost tracking
-26. Data retention cron + backup cron (cascade embedding deletes with item retention)
-27. Observability (cost dashboard, pipeline status, secret masking)
-28. Health monitoring (`health_events` table, 7 checks every 5min, alert webhook, process heartbeat watchdog)
-29. Discovery endpoints (Discord guilds, RSS auto-detect)
-30. Graceful shutdown + Caddy TLS + pm2/systemd deploy
+21. Entity tables (entities, entity_aliases with context_key, entity_mentions) + three-tier resolution from summary JSON
+22. CoinGecko seeding + Indonesian entity seeds
+23. Entity relevance decay + archival cron (archive instead of delete, reactivation on re-mention)
+23.5. Trust weight auto-adjustment (SQL, runs 1h after each flash alert, ±0.2 bounds from initial weight)
+23.6. Narrative clustering (k-means on summary embeddings, Haiku naming, signal strength classification, narratives table)
+24. Item embedding (batch cron every 15 min) + entity embedding (inline on create/update)
+25. Postgres full-text search (tsvector/tsquery) + search endpoint (keyword fallback)
+26. `llm_usage` table + cost tracking
+27. Data retention cron + backup cron (cascade embedding deletes with item retention, expired session cleanup)
+28. Observability (cost dashboard, pipeline status, secret masking)
+29. Health monitoring (`health_events` table, 7 checks every 5min, alert webhook, process heartbeat watchdog)
+30. Discovery endpoints (Discord guilds, RSS auto-detect)
+31. Graceful shutdown + Caddy TLS + pm2/systemd deploy
 
 **Goal**: all sources ingesting, entity resolution working, dashboard live, semantic search and RAG chat operational. Everything ships together.

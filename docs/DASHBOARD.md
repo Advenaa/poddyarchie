@@ -5,7 +5,38 @@ Background `#0a0a0f`, cards `#111118`, text `#e2e2e8`.
 
 ---
 
-## 1. Report View (`/`)
+## 1. Login (`/login`)
+
+Minimal public page. Dark theme consistent with rest of dashboard.
+
+```
++------------------------------------------------------------------------+
+|                                                                        |
+|                                                                        |
+|                                                                        |
+|                          [P] Podders                                   |
+|                                                                        |
+|                    +-------------------------+                         |
+|                    |  Sign in with Discord   |                         |
+|                    +-------------------------+                         |
+|                                                                        |
+|                    (error message area)                                 |
+|                                                                        |
+|                                                                        |
++------------------------------------------------------------------------+
+```
+
+**Behavior notes:**
+- "Sign in with Discord" button links to `GET /api/v1/auth/discord`.
+- Error messages rendered from query params:
+  - `?error=unauthorized` → "You're not authorized — ask an admin to invite you"
+  - `?error=blocked` → "Your access has been blocked"
+- Error text uses accent red (`#cc4455`), centered below the button.
+- No header nav on this page — only the logo and sign-in button.
+
+---
+
+## 2. Report View (`/`)
 
 Latest report. TL;DR visible immediately. Progressive disclosure below.
 
@@ -111,7 +142,7 @@ Latest report. TL;DR visible immediately. Progressive disclosure below.
 
 ---
 
-## 2. Report List (`/reports`)
+## 3. Report List (`/reports`)
 
 ### Desktop (1200px)
 
@@ -178,9 +209,9 @@ Latest report. TL;DR visible immediately. Progressive disclosure below.
 
 ---
 
-## 3. Settings (`/settings`)
+## 4. Settings (`/settings`)
 
-Three tabs: Sources, Delivery, Pipeline Health.
+Four tabs: Sources, Delivery, Pipeline Health, Users (admin only).
 
 ### Desktop (1200px)
 
@@ -190,7 +221,7 @@ Three tabs: Sources, Delivery, Pipeline Health.
 +------------------------------------------------------------------------+
 |                                                                        |
 |  SETTINGS                                                              |
-|  [Sources]  [Delivery]  [Pipeline Health]                              |
+|  [Sources]  [Delivery]  [Pipeline Health]  [Users]*                    |
 |                                                                        |
 +-- TAB: Sources ----------------------------------------------------+   |
 |                                                                    |   |
@@ -338,14 +369,42 @@ Triggered by `+ Add Source` > Discord. Calls `GET /api/v1/sources/discover/disco
 +--------------------------------------------------------------------+
 ```
 
+### TAB: Users (admin only)
+
+```
++--------------------------------------------------------------------+
+|                                                                    |
+|  AUTHORIZED USERS                                                  |
+|                                                                    |
+|  +--------------------------------------------------------------+  |
+|  | (O) satoshi       Admin    Last login: 2h ago                |  |
+|  | (O) vitalik       Viewer   Last login: 1d ago       [Remove] |  |
+|  | (O) degen_mike    Viewer   Last login: 3d ago       [Remove] |  |
+|  +--------------------------------------------------------------+  |
+|                                                                    |
+|  INVITE USER                                                       |
+|  Discord User ID: [                                            ]   |
+|  Role:            [Viewer v]                                       |
+|  [Invite]                                                          |
+|                                                                    |
++--------------------------------------------------------------------+
+```
+
+*`[Users]` tab only visible to admin users.
+
 ### Mobile: Settings
 
 Tabs render as full-width pill bar. Each tab content stacks vertically.
 Source rows become cards. Add-source modals go full-screen on mobile.
 
+**Role-based behavior:**
+- Viewers: settings page is read-only. Mutation controls (toggle switches, delete buttons, save buttons, add source) are disabled or hidden. No Users tab.
+- Admins: full access to all tabs including Users. Can invite/remove users and change roles.
+- Role badge shown next to current user in header as a subtle pill (e.g., "Admin" or "Viewer").
+
 ---
 
-## 4. Raw Discord Feed (`/feed`)
+## 5. Raw Discord Feed (`/feed`)
 
 Live view of unprocessed Discord messages with image attachments. Backed by `GET /api/v1/feed` which returns raw items from Discord sources with `status: 'ready'` or `'processed'`, most recent first.
 
@@ -421,7 +480,7 @@ Live view of unprocessed Discord messages with image attachments. Backed by `GET
 
 ---
 
-## 5. Chat (`/chat`)
+## 6. Chat (`/chat`)
 
 RAG chat interface. User asks questions about their data, Sonnet answers grounded in summaries, reports, and items retrieved via semantic search.
 
@@ -523,7 +582,7 @@ RAG chat interface. User asks questions about their data, Sonnet answers grounde
 
 ---
 
-## 6. Empty States
+## 7. Empty States
 
 ### No Reports (`/`)
 
@@ -598,11 +657,11 @@ RAG chat interface. User asks questions about their data, Sonnet answers grounde
 
 ---
 
-## 7. Component Inventory
+## 8. Component Inventory
 
 | Component | Description |
 |-----------|-------------|
-| `Header` | App name, nav links (Reports, Feed, Chat, Settings), hamburger on mobile. Fixed top. |
+| `Header` | App name, nav links (Reports, Feed, Chat, Settings), Discord avatar (32px circle) + username + role badge + logout on right. Hamburger on mobile. Fixed top. |
 | `ReportCard` | Used in `/reports` list. Shows date, type badge, TL;DR preview (2-line truncated). Click navigates to full report. |
 | `ReportHeader` | Date, type badge (DAILY/FLASH), source count. Used at top of ReportView. |
 | `TldrBlock` | Large Georgia serif quote block. The hero element of every report. |
@@ -629,10 +688,49 @@ RAG chat interface. User asks questions about their data, Sonnet answers grounde
 | `ChatMessage` | Single message bubble. Renders user messages (right-aligned, muted surface) or Podders responses (left-aligned, surface card with source citations). Timestamp in text-secondary. |
 | `SourceCitation` | Clickable pill showing source type icon + truncated snippet. Links to `/reports/:id` for reports, or displays summary/item detail. Accent blue text, surface-raised background. |
 | `LoadMoreButton` | Pagination trigger. Shows "Load more" with count remaining. |
+| `LoginPage` | Public route. Podders logo, "Sign in with Discord" button, error message area. Error states from `?error=` query params. |
+| `ProtectedRoute` | Wrapper component. Checks auth context, redirects to Discord OAuth if not authenticated. All routes except `/login` wrapped in this. |
+| `AuthProvider` | Context provider wrapping the app. Calls `GET /api/v1/auth/me` on mount. Provides `user` object (`discordId`, `username`, `avatar`, `role`) and `loading` state. Exposes `logout()` function (calls `POST /api/v1/auth/logout`, redirects to `/login`). |
+| `UserAvatar` | 32px circle showing Discord avatar from `cdn.discordapp.com`. Falls back to first letter of username if no avatar URL. |
+| `RoleBadge` | Subtle pill next to username in header: "Admin" or "Viewer". Muted styling, not prominent. |
+| `UserRow` | Row in Users tab: Discord avatar, username, role dropdown (admin/viewer), last login timestamp, remove button. Current user's row has no remove button. |
 
 ---
 
-## 8. Color & Theme
+## 9. Router & Auth
+
+### Route Table
+
+| Route | Access | Component |
+|-------|--------|-----------|
+| `/login` | Public | `LoginPage` |
+| `/` | Protected | `ReportView` |
+| `/reports` | Protected | `ReportList` |
+| `/reports/:id` | Protected | `ReportView` |
+| `/feed` | Protected | `RawFeed` |
+| `/chat` | Protected | `Chat` |
+| `/settings` | Protected | `Settings` |
+
+### Auth Context
+
+`AuthProvider` wraps the app at the root level.
+
+- On mount, calls `GET /api/v1/auth/me`.
+  - `200`: sets `user` object (`discordId`, `username`, `avatar`, `role`), `loading: false`.
+  - `401`: sets `user: null`, `loading: false`.
+- Provides: `user`, `loading`, `logout()`.
+- `logout()`: calls `POST /api/v1/auth/logout`, then redirects to `/login`.
+
+### Protected Routes
+
+All routes except `/login` are wrapped in `ProtectedRoute`:
+- If `loading`: show nothing (or spinner).
+- If `user === null`: redirect to `/login`.
+- If `user` exists: render children.
+
+---
+
+## 10. Color & Theme
 
 Dark theme. All colors specified as hex + Tailwind class.
 

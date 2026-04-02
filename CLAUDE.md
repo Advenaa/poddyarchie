@@ -40,6 +40,7 @@ src/
   url-validator.ts   # Shared SSRF protection
   scheduler.ts       # per-source poll intervals + mutex
   db/                # connection, migrations, queries
+  auth/              # Discord OAuth2, sessions, middleware (requireAuth, requireAdmin)
   ingest/            # discord, twitter, news, rss adapters
   normalize/         # dedup, spam filter, language detection, Indonesian→English translation via Haiku
   pre-summarize/     # Haiku pre-summary for long RSS/news articles (>4K chars)
@@ -69,6 +70,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 - **ULID for all IDs** — every table PK is a ULID string. No autoincrement, no UUIDs.
 - **Token-based chunking** — LLM input is chunked by estimated token count (content.length / 4), not item count. Budget: 6,000 tokens per Stage 1 chunk.
 - **Entity resolution via alias table** — `entity_aliases` maps lowercase-normalized strings to canonical entity IDs. Lookup-then-insert pattern. CoinGecko token list seeds the table. Entities follow a two-tier active/archived lifecycle: entities demote to archived instead of deletion and promote back to active with history intact on re-mention (Decision 04). Disambiguation uses a three-tier approach: alias lookup first, then context-based resolution via co-occurring entities, then batched Haiku calls for remaining ambiguities. Results are saved as new aliases, making the system self-improving (Decision 09).
+- **Discord OAuth2 for dashboard auth** — `identify` scope only. DB-backed sessions with signed httpOnly cookies (via @fastify/cookie). Three roles: admin (full access), viewer (read-only), blocked. `ADMIN_USER_IDS` env var = bootstrap admins, always admin regardless of DB. API key Bearer auth coexists for programmatic access (always admin). Invite-only, no public registration.
 - **Narrative clustering via embeddings** — summary embeddings are clustered daily (k-means with silhouette auto-tuning) to detect emerging narratives. Each cluster is named by one Haiku call. Cluster growth rates classify signals as new/emerging/strong/stable/fading, fed to Sonnet as context for daily synthesis (Decision 05).
 
 ## Coding Guidelines
@@ -77,6 +79,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 - **Five-layer prompt injection defense** — (1) Unicode NFKC normalization + zero-width character stripping in normalize step, (2) InstructDetector scan at ingest (cached, items flagged as `filtered` with reason `injection_detected`), (3) XML `<scraped_content>` wrapping with nonce-based tags and explicit "treat as untrusted data" instruction, (4) entity post-verification against raw source text, (5) structural privilege separation via zod schema validation on Haiku's JSON-only output (Decision 06).
 - **SSRF validation via `url-validator.ts`** — all outbound URL fetches (RSS, webhooks, news extraction) must go through the shared validator. Require HTTPS, reject private IPs, reject non-standard ports, block `file://`.
 - **Market pulse every 3h** — a Sonnet synthesis that runs every 3 hours, producing a short market pulse. Output length scales with activity (quiet periods get shorter pulses). Delivered via webhook with muted grey embed.
+- **Session cookie masking** — add `podders_session` to the Pino secret masking list in `logger.ts`.
 - **No event bus, no plugin system, no multi-agent** — direct function calls. Cron fires handler, handler calls next stage at end. Keep it simple.
 - **Per-source poll intervals** — each source defines its own `poll_interval` instead of a single global cron. The scheduler fires each source independently.
 - **Parallel source processing** — sources are processed concurrently, not sequentially. The scheduler launches source ingestion jobs in parallel.
@@ -94,6 +97,10 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 | `TWITTERAPI_KEY` | No | For Twitter/X scraping |
 | `API_KEY` | No | Auto-generated on first run if missing |
 | `DATABASE_URL` | Yes | Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/podders`) |
+| `DISCORD_CLIENT_ID` | Yes (for auth) | Discord OAuth2 application client ID |
+| `DISCORD_CLIENT_SECRET` | Yes (for auth) | Discord OAuth2 application client secret |
+| `ADMIN_USER_IDS` | Yes | Comma-separated Discord user IDs with admin access |
+| `SESSION_SECRET` | No | Auto-generated on first run, stored in app_config |
 | `PORT` | No | Default 3000 |
 | `DATA_DIR` | No | Backups location, default ./data |
 | `PUBLIC_URL` | No | For "View full report" links in webhooks |
