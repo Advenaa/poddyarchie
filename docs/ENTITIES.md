@@ -107,7 +107,13 @@ Relevance tracks how "hot" an entity is. Updated on every mention and decayed da
 relevance = relevance * 0.95^days_since_update + log(1 + mentions) * source_weight
 ```
 
-Source weights: `Discord = 1.0`, `Twitter = 1.5`, `News = 2.0`.
+The daily decay applies a flat 5% reduction: `relevance = relevance * 0.95`. Mention boosts happen in real time during Stage 1 processing, weighted by source type:
+
+| Source | Weight | Rationale |
+|--------|--------|-----------|
+| News | 3x | Rarest and highest signal — a news mention is editorially curated |
+| Twitter | 2x | Moderate signal — public but noisy |
+| Discord | 1x (base) | Highest volume, most noise |
 
 News is weighted highest because news mentions are rarest and highest signal. Discord is lowest because volume is highest and noise is greatest.
 
@@ -123,15 +129,15 @@ News is weighted highest because news mentions are rarest and highest signal. Di
 | Relevance = 0.5 | | Entity was recently active but thinning out |
 | Relevance = 0.01 | | Effectively dead -- prune candidate |
 
-### Daily Cron
+### Daily Decay Cron
 
-Runs at `00:00 UTC`:
+Runs at **00:10 UTC** (referenced in DEPLOYMENT.md), after the daily report cron completes.
 
 ```sql
-UPDATE entities SET relevance = relevance * 0.95;
+UPDATE entities SET relevance = relevance * 0.95 WHERE relevance > 0.01;
 ```
 
-Applied to every entity, every day. Mention-driven boosts happen in real time during Stage 1 processing.
+The `WHERE relevance > 0.01` guard skips entities already below the prune threshold, avoiding unnecessary writes and keeping near-zero values from decaying to infinitesimally small numbers. Applied daily. Mention-driven boosts happen in real time during Stage 1 processing.
 
 ## Pruning
 
@@ -141,6 +147,10 @@ An entity is pruned when **both** conditions are true:
 
 - `relevance < 0.01`
 - `last_seen < now - 90 days`
+
+```sql
+DELETE FROM entities WHERE relevance < 0.01 AND last_seen_at < NOW() - INTERVAL '90 days';
+```
 
 The dual condition prevents pruning a low-relevance entity that was just re-discovered (new `last_seen`) or a stale entity that still has residual relevance from high historical activity.
 

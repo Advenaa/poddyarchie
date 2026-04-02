@@ -113,7 +113,7 @@ interface RawItem {
 
 Runs on every incoming item. Pure rule-based — no LLM calls.
 
-1. **Truncate** — items exceeding 5,000 estimated tokens (~20K chars) are truncated to that limit. Prevents single oversized items (e.g., full articles from RSS) from blowing the Stage 1 chunk budget.
+1. **Truncate** — items exceeding 20,000 characters are truncated to that limit. Prevents single oversized items (e.g., full articles from RSS) from blowing the Stage 1 chunk budget.
 2. **Dedup** — `sha256(source + sourceId + content.slice(0, 200))`. Plus exact URL match across sources after URL expansion. No SimHash for MVP — exact hash + URL dedup covers 90%.
 3. **URL expansion** — resolve t.co, bit.ly redirects for cross-source dedup.
 4. **Spam filter** — rule-based. English: bot accounts, sub-5-word posts, "gm/gn". Indonesian: "wm", "done min/sudah min", "gas!", "mantap", single-emoji, airdrop copypasta. Kills 40-60% of Discord volume.
@@ -359,7 +359,7 @@ CREATE TABLE entity_mentions (
   mention_count INTEGER DEFAULT 1,
   created_at INTEGER NOT NULL
 );
-CREATE INDEX idx_mentions_entity_ts ON entity_mentions(entity_id, created_at);
+CREATE INDEX idx_mentions_entity_ts ON entity_mentions(created_at, entity_id);
 CREATE INDEX idx_mentions_created_entity ON entity_mentions(created_at, entity_id);
 ```
 
@@ -601,7 +601,35 @@ All endpoints: `/api/v1/*`. All require `Authorization: Bearer <api_key>`.
 
 How it works: user question is embedded via Gemini (same model as all embeddings), cosine similarity finds top 10 relevant summaries/reports/items from the in-memory vector cache, those results plus last 5 messages of conversation history are passed to Sonnet as context, Sonnet generates an answer grounded in the retrieved data. Conversation history stored in memory (cleared on restart). Sonnet system prompt instructs: answer ONLY from provided context, cite sources, say "I don't have data on that" if no relevant results, never speculate beyond the data. Each chat message = 1 Gemini embedding call + 1 Sonnet call.
 
-20 endpoints total.
+**Vector retrieval details**: cosine similarity (standard for text embeddings). Retrieves top-10 results with no minimum similarity threshold -- Sonnet judges relevance from context rather than a hard cutoff. The vector cache is loaded into memory on startup from the `embeddings` table and rebuilt if the embedding model changes. Memory budget: ~50MB for 20K vectors x 768 dims x 4 bytes (Float32), well within VPS RAM. Conversation state is kept in-memory per session with no persistence across server restarts.
+
+**Settings:**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `PATCH` | `/api/v1/settings` | Body: `{ webhookUrl?, digestTime?, alertWebhookUrl? }`. Update webhook URL, digest time, or alert webhook. |
+
+**Deliveries:**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `GET` | `/api/v1/deliveries?status=failed` | `{ deliveries: [{ id, reportId, status, error, createdAt, retriedAt }] }` — list failed deliveries |
+| `POST` | `/api/v1/deliveries/:id/retry` | `{ ok: true }` — retry a failed delivery |
+| `DELETE` | `/api/v1/deliveries/:id` | `{ ok: true }` — clear a failed delivery from the list |
+
+**Costs:**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `GET` | `/api/v1/costs?period=day\|week\|month` | `{ costs: [{ model, stage, calls, inputTokens, outputTokens, costUsd }], total: number }` — cost breakdown by model and stage |
+
+**Source Admin:**
+
+| Method | Path | Response |
+|--------|------|----------|
+| `POST` | `/api/v1/sources/:source/:sourceId/reset` | `{ ok: true }` — reset `error_count` to 0 and status to `active` |
+
+26 endpoints total.
 
 ### Webhook Content
 

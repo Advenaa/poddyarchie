@@ -38,6 +38,44 @@ Model IDs live in `config.ts` as Pi model identifiers. Never hardcode model stri
 | Market pulse | Sonnet | `claude-sonnet-4-6-20250514` |
 | Chat (RAG) | Sonnet | `claude-sonnet-4-6-20250514` |
 
+## Pi AI Provider Configuration
+
+All LLM calls go through `@mariozechner/pi-ai` (Pi), which abstracts multi-provider support behind a unified interface.
+
+### Model Identifiers
+
+Models are configured in `config.ts` using Pi's `provider:model` format:
+
+```
+anthropic:claude-haiku-4-5-20251001
+anthropic:claude-sonnet-4-6-20250514
+openai:gpt-4o-mini
+groq:llama-3.1-70b-versatile
+```
+
+The provider prefix tells Pi which API to call. The model suffix is the provider's native model ID. When no prefix is given, Pi defaults to Anthropic.
+
+### Switching Providers
+
+To switch providers:
+
+1. Change the model identifier in `config.ts` (e.g. `anthropic:claude-haiku-4-5-20251001` to `openai:gpt-4o-mini`).
+2. Add the provider's API key to `.env` (e.g. `OPENAI_API_KEY=sk-...`).
+3. No code changes needed -- prompt format differences are handled by Pi internally. Pi translates system/user/assistant messages to each provider's native format.
+
+### Cost Tracking Across Providers
+
+Pi's `response.usage.cost.total` returns the USD cost for every call, regardless of provider. No manual price tables needed in Podders -- Pi stays current with each provider's published pricing.
+
+### Tested / Recommended Providers
+
+| Provider | Use Case | Model |
+|----------|----------|-------|
+| Anthropic | Stage 1 (summarize, classify) | Claude Haiku |
+| Anthropic | Stage 3 (synthesis), pulse, chat | Claude Sonnet |
+
+Other Pi-supported providers (OpenAI, Google, Groq, Mistral) work but have not been regression-tested against the prompt suite. If switching, run `npm run test:prompts` to verify output quality.
+
 ## Retry Decision Tree
 
 ```
@@ -152,15 +190,18 @@ Daily cost total is exposed via `GET /api/v1/status` (`llmCostToday` field).
 
 ### Expected Daily Cost (~5,000 items/day)
 
-| Stage | Calls/day | Model | Cost |
-|-------|-----------|-------|------|
-| Summarize | ~30 | Haiku | ~$0.05 |
-| Synthesize (daily) | 1 | Sonnet | ~$0.30 |
-| Synthesize (flash) | 0-3/mo | Sonnet | ~$0.01 |
-| Urgency classify | 50-100 | Haiku | ~$0.01 |
-| Pulse | 8 | Sonnet | ~$0.80 |
-| Chat (RAG) | ~10-20 | Sonnet | ~$0.15-0.30 |
-| **Total** | | | **~$1.32-1.47/day** |
+| Stage | Calls/day | Model | Cost | Breakdown |
+|-------|-----------|-------|------|-----------|
+| Summarize (Stage 1) | ~50 | Haiku | ~$0.15 | 50 × 6K input × $0.25/M + 50 × 1K output × $1.25/M |
+| Pulse | 8 | Sonnet | ~$0.11 | 8 × 2K input × $3/M + 8 × 500 output × $15/M |
+| Synthesize (daily) | 1 | Sonnet | ~$0.05 | |
+| Synthesize (flash) | rare | Sonnet | ~$0.05 | |
+| Chat (RAG) | ~10-20 | Sonnet | ~$0.15-0.30 | Depends on usage |
+| Embeddings | ~500-800 | Gemini | $0 | Free tier |
+| twitterapi.io | — | — | ~$0.30 | $9/month |
+| **Total** | | | **~$0.81-0.96/day (~$25-29/month)** | |
+
+> **Gemini free tier**: allows 1,500 requests/day. At 30 Discord channels + Twitter + RSS, expect ~500-800 embedding requests/day. Headroom exists but monitor usage — paid tier is required if exceeded.
 
 ## Retry Safety
 

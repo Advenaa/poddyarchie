@@ -288,3 +288,21 @@ residual risk as #7).
 
 Total new work: ~5-6 days. The most critical items (rate limiting, content policy, cost
 breaker) are half-day tasks each and block the most impactful attacks.
+
+---
+
+## 9. Key Rotation
+
+How each secret behaves during rotation.
+
+| Secret | Rotation Procedure | Behavior During Rotation |
+|--------|--------------------|--------------------------|
+| `ANTHROPIC_API_KEY` / `GEMINI_API_KEY` | Update `.env`, restart process | In-flight LLM calls complete with the old key (HTTP connection already established). New calls use the new key after restart. |
+| `DISCORD_TOKENS` | Update `.env`, restart process | WebSocket disconnects and reconnects with the new token on restart. Expect ~5-10s of missed messages (same as any restart). |
+| `TWITTERAPI_KEY` | Update `.env`, restart process | Next poll uses the new key. No in-flight concern (REST, not streaming). |
+| `API_KEY` (dashboard auth) | Rotate via settings endpoint (`POST /api/v1/auth/rotate`) | Can be rotated without restart. Active sessions are invalidated immediately. |
+
+**Recommendations**:
+- Rotate all keys quarterly as a matter of hygiene.
+- Rotate immediately if any key is suspected compromised.
+- After rotation, verify the service is healthy via `GET /api/v1/status` and check logs for auth errors.

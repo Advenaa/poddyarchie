@@ -89,7 +89,7 @@ See [ARCHITECTURE.md](./ARCHITECTURE.md) for full schema, API contract, and buil
 |-----|----------|-------|
 | `ANTHROPIC_API_KEY` | Yes (if using Claude models) | Claude API key. Other provider keys (e.g. `OPENAI_API_KEY`, `GOOGLE_API_KEY`) can be added as needed for Pi-supported models |
 | `GEMINI_API_KEY` | Yes | Google Gemini API key for embeddings (free tier: 1500 req/day) |
-| `DISCORD_TOKENS` | No | Comma-separated user tokens (needed for Discord sources) |
+| `DISCORD_TOKENS` | No | Comma-separated user token strings (needed for Discord sources) |
 | `TWITTERAPI_KEY` | No | For Twitter/X scraping |
 | `API_KEY` | No | Auto-generated on first run if missing |
 | `DATABASE_URL` | Yes | Postgres connection string (e.g. `postgresql://user:pass@localhost:5432/podders`) |

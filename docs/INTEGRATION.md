@@ -11,7 +11,7 @@ RSS entry → Ingest → Normalize → Pre-summarize → Wait → ─── same
                                       ↓                                       ↓
 News article → Ingest → Normalize → Pre-summarize → Wait → ─── same ── Report → Webhook
 
-                                                              Every 3h ── Pulse (Haiku) → Webhook
+                                                              Every 3h ── Pulse (Sonnet) → Webhook
 ```
 
 ## Step by Step

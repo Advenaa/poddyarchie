@@ -334,7 +334,74 @@ WHERE created_at >= $1 AND created_at < $2
 GROUP BY stage
 ```
 
-## 10. Retention
+## 10. Source Rate History
+
+```typescript
+function upsertSourceRateHistory(source: string, sourceId: string, hourOfDay: number, dayOfWeek: number, newRate: number): void
+```
+```sql
+INSERT INTO source_rate_history (source, source_id, hour_of_day, day_of_week, avg_rate, sample_count, updated_at)
+VALUES ($1, $2, $3, $4, $5, 1, $6)
+ON CONFLICT (source, source_id, hour_of_day, day_of_week) DO UPDATE SET
+  avg_rate = (source_rate_history.avg_rate * source_rate_history.sample_count + $5)
+             / (source_rate_history.sample_count + 1),
+  sample_count = source_rate_history.sample_count + 1,
+  updated_at = $6
+```
+Rolling average. Called after each Discord processing cycle to update the baseline lambda for the Poisson claim gate. `newRate` = items processed / elapsed hours.
+
+```typescript
+function getSourceRateHistory(source: string, sourceId: string, hourOfDay: number, dayOfWeek: number): { avg_rate: number } | null
+```
+```sql
+SELECT avg_rate FROM source_rate_history
+WHERE source = $1 AND source_id = $2 AND hour_of_day = $3 AND day_of_week = $4
+```
+Returns the learned lambda for a given source at a specific hour-of-day and day-of-week. Used by the Poisson claim gate to compute expected message rate. Returns `null` if no history exists (falls back to a default lambda).
+
+## 11. Embeddings
+
+```typescript
+function upsertEmbedding(targetType: string, targetId: string, vector: Buffer, model: string): void
+```
+```sql
+INSERT INTO embeddings (id, target_type, target_id, model, dimensions, vector, created_at)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
+ON CONFLICT (target_type, target_id) DO UPDATE SET
+  model = EXCLUDED.model,
+  dimensions = EXCLUDED.dimensions,
+  vector = EXCLUDED.vector,
+  created_at = EXCLUDED.created_at
+```
+Idempotent insert. Re-embedding the same target (e.g., after model migration) overwrites the previous vector.
+
+```typescript
+function searchEmbeddings(vector: Buffer, targetType: string, limit: number): { target_id: string; target_type: string; similarity: number }[]
+```
+```sql
+SELECT target_id, target_type, vector FROM embeddings
+WHERE target_type = $1
+ORDER BY created_at DESC
+```
+Returns all vectors for the given `target_type`. Cosine similarity is computed in JS (not SQL) against the query `vector`. Results are sorted by similarity descending and truncated to `limit` in application code. See [docs/EMBEDDINGS.md](./docs/EMBEDDINGS.md) for why BYTEA + JS cosine beats pgvector at our scale.
+
+```typescript
+function deleteEmbeddingsByModel(excludeModel: string): number
+```
+```sql
+DELETE FROM embeddings WHERE model != $1
+```
+Model migration cleanup. After switching embedding models, delete all vectors from the old model so the batch re-embed job regenerates them. Returns count of deleted rows.
+
+```typescript
+function deleteEmbeddingsByRef(targetType: string, targetId: string): void
+```
+```sql
+DELETE FROM embeddings WHERE target_type = $1 AND target_id = $2
+```
+Cascading delete. Called when the referenced record (item, summary, entity, report) is deleted.
+
+## 12. Retention
 
 All run in the daily retention cron (after entity decay).
 
@@ -342,17 +409,21 @@ All run in the daily retention cron (after entity decay).
 function deleteOldItems(cutoff: number): number
 ```
 ```sql
+DELETE FROM embeddings WHERE target_type = 'item'
+  AND target_id IN (SELECT id FROM items WHERE status = 'processed' AND created_at < $1);
 DELETE FROM items WHERE status = 'processed' AND created_at < $1
 ```
-`cutoff` = now - 30 days. Summaries are the archival layer.
+`cutoff` = now - 30 days. Summaries are the archival layer. Embeddings are cascade-deleted first — the `embeddings` table has no FK constraint, so the application must delete them explicitly before removing the referenced items. Both statements run in a single transaction.
 
 ```typescript
 function deleteOldSummaries(cutoff: number): number
 ```
 ```sql
+DELETE FROM embeddings WHERE target_type = 'summary'
+  AND target_id IN (SELECT id FROM summaries WHERE created_at < $1);
 DELETE FROM summaries WHERE created_at < $1
 ```
-`cutoff` = now - 90 days.
+`cutoff` = now - 90 days. Embedding cascade same pattern as `deleteOldItems`.
 
 ```typescript
 function deleteOldMentions(cutoff: number): number

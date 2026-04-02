@@ -51,7 +51,7 @@ Visual navigation doc. ASCII diagrams showing every data flow in the system.
 +---------------+     +---------------------+
 | correlate.run |     | urgency='breaking'? |
 | entities in   |     | 2+ sources OR       |
-| 2+ sources    |     | 3+ chunks?          |
+| 2+ sources    |     | 3+ chunks w/in 30m? |
 | within 24h    |     +----------+----------+
 +-------+-------+                |yes
         |                        v
@@ -243,7 +243,7 @@ DISAMBIGUATION: UNIQUE(name, type) -- same name can be token AND company
   ~~~~~~~~~~~~                                    ~~~~~~~~~~~~
   Inputs:                                         Trigger:
     summaries (prev calendar day)                   Stage 1 returns urgency:'breaking'
-    correlated entities (24h)                       Corroboration: 2+ sources OR 3+ chunks
+    correlated entities (24h)                       Corroboration: 2+ sources OR 3+ chunks within 30 minutes
     yesterday's TL;DR (temporal anchor)             (single chunk = log only, no flash)
     raw exemplars (7 engagement
       + 3 RSS/news reserved)                      Scope: last 4h summaries only

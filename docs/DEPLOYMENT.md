@@ -162,10 +162,19 @@ Crash recovery handles in-flight LLM work: orphaned `processing` items reset to 
 
 ### Daily Backup
 
-`pg_dump` after entity decay cron (DB quietest at 00:10 UTC). Timestamped files in `backups/`, retain 7 days. Uses `--format=custom` for compression and selective restore.
+Automated via cron. Runs daily at 02:00 UTC, writes compressed dumps to `/var/backups/podders/`. Retains 7 daily backups; older files are deleted automatically.
+
+**Cron line** (add to the `podders` user's crontab):
 
 ```bash
-pg_dump --format=custom --file=backups/podders-$(date +%Y%m%d-%H%M%S).dump "$DATABASE_URL"
+0 2 * * * pg_dump $DATABASE_URL | gzip > /var/backups/podders/podders_$(date +\%Y\%m\%d).sql.gz && find /var/backups/podders/ -mtime +7 -delete
+```
+
+Ensure `/var/backups/podders/` exists and is writable by the `podders` user:
+
+```bash
+sudo mkdir -p /var/backups/podders
+sudo chown podders:podders /var/backups/podders
 ```
 
 ### Verification
@@ -173,7 +182,7 @@ pg_dump --format=custom --file=backups/podders-$(date +%Y%m%d-%H%M%S).dump "$DAT
 After backup, verify the dump is valid and contains data:
 
 ```bash
-pg_restore --list backups/podders-TIMESTAMP.dump > /dev/null 2>&1
+gunzip -t /var/backups/podders/podders_YYYYMMDD.sql.gz
 if [ $? -ne 0 ]; then
   echo "Backup verification failed"
   exit 1
@@ -184,8 +193,19 @@ fi
 
 ```bash
 pm2 stop podders  # or: sudo systemctl stop podders
-pg_restore --clean --if-exists --dbname="$DATABASE_URL" backups/podders-TIMESTAMP.dump
+gunzip < /var/backups/podders/podders_YYYYMMDD.sql.gz | psql $DATABASE_URL
 pm2 start podders  # or: sudo systemctl start podders
+```
+
+### Restore Testing
+
+Test restore monthly on a separate database to verify backups are usable:
+
+```bash
+createdb podders_restore_test
+gunzip < /var/backups/podders/podders_YYYYMMDD.sql.gz | psql podders_restore_test
+# Verify data, then clean up:
+dropdb podders_restore_test
 ```
 
 ## Secret Rotation

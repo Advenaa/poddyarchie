@@ -73,7 +73,7 @@ function shouldSkipPreSummary(item: ReadyItem): boolean {
 
 ### Compression
 
-Flat `maxTokens: 300` (not proportional to input length). Two prompt variants selected by content classification:
+`maxTokens: 300` per article (scales with batch size: `300 * batch.length`). Two prompt variants selected by content classification:
 
 **Regulatory variant** (articles matching regulatory/policy keywords):
 ```
